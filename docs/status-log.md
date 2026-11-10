@@ -258,3 +258,73 @@ produce evidence instead of another shrug:
 ./scripts/watch-pluto.sh -d 300      # then replug the radio while it runs
 grep -A6 "device appeared" pluto-watch-*.log
 ```
+
+---
+
+## 2026-11-10 11:12 — external power. It works.
+
+The radio was given **external power** and re-seated. It has not dropped since.
+
+```
+Nov 10 11:12:30 xavieragx kernel: usb 1-4.4.3: new high-speed USB device number 30 ...
+Nov 10 11:12:30 xavieragx kernel: usb 1-4.4.3: Product: PlutoSDR (ADALM-PLUTO)
+Nov 10 11:12:31 xavieragx kernel: usb 1-4.4.3: USB disconnect, device number 30
+Nov 10 11:12:41 xavieragx kernel: usb 1-4.4.3: new high-speed USB device number 31 ...
+Nov 10 11:12:41 xavieragx kernel: usb 1-4.4.3: Product: PlutoSDR (ADALM-PLUTO)
+            <- and nothing since: no reset, no disconnect
+```
+
+`watch-pluto.sh` recorded it going from `cfg=UNCONFIGURED` to `CONFIGURED as value 1` at 11:12:41.976,
+and then **no further state change at all** — the log's last line is that moment. Two minutes later
+it is still up, still configured, no disconnect in the kernel log.
+
+That is the first time this radio has ever stayed: every previous plug died in one to four seconds,
+once without even finishing configuration (`EPROTO` on SET_CONFIGURATION).
+
+### What the four attempts add up to
+
+| # | Time | Power | Outcome |
+|---|---|---|---|
+| 1 | 10:44:55 | bus | configured, then reset and dropped after ~4 s |
+| 2 | 11:02:32 | bus | `can't set config #1, error -71`, never configured |
+| 3 | 11:09:58 | bus, and the bus otherwise empty | configured, dropped after ~1 s |
+| 4 | 11:12:41 | **external** | **configured and stable** |
+
+So the cause was the radio's own supply. Note how the earlier reasoning arrived there: attempt 3
+was the one that mattered, because removing every other device and still failing ruled out the
+host's budget, which made "the radio cannot run on what the port gives it" the surviving
+explanation. Attempts 1 and 2 would have supported either story; attempt 3 decided it. The cable
+was never changed and did not need to be.
+
+The 500 mA the device asks for is more than a bus-powered port behind two hubs ended up delivering,
+and external power settled it. That is worth writing down plainly, because the intermediate theory
+in this file - "a shared budget on a bus-powered hub" - was wrong in its mechanism even though the
+answer was power.
+
+### A bug in this project's own tooling, found by the same test
+
+With the radio healthy and configured, `probe-pluto.sh` still said **FAIL**, because it judged health
+by `/sys/bus/iio/devices/iio:device*`. **A Pluto on USB never has a kernel IIO device**: the IIO
+protocol runs over libusb in user space, so that directory is empty even when everything works. The
+check was measuring the wrong thing and would have reported a working radio as broken forever.
+
+Corrected in both tools: the test is now **"can libiio produce a `usb:` context?"**
+(`pluto_probe --scan`, which exits 0 only if one exists). The verdict distinguishes the three
+states that used to be collapsed into one:
+
+| State | What it means |
+|---|---|
+| libiio can open a `usb:` context | working — go and capture |
+| device present, `bConfigurationValue` empty | never configured — power or firmware |
+| device present and configured, node not writable | **permissions** — install the udev rule |
+| device present, configured, node writable, still no context | the IIO function itself is not answering |
+
+Right now the radio is in the third state. `/dev/bus/usb/001/031` is `crw-rw-r-- root root`, and
+libusb needs write access, so `libiio` sees nothing. That is what `scripts/install-pluto-udev.sh` is
+for, and it needs one `sudo` run.
+
+### Next, once the udev rule is in
+
+`./scripts/probe-pluto.sh --capture -v` — which prints, for the first time, the answers this whole
+design has been waiting on: `sampling_frequency_available` (the rate floor), `hardwaregain` and its
+range, and a real capture with crest factor and clipping counts.

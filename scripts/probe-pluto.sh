@@ -62,6 +62,7 @@ PLUTO_PORT=
 PLUTO_VIDPID=
 PLUTO_SERIAL=
 PLUTO_PRODUCT=
+CONFIGURED=
 USB_NODE=
 
 for dev in /sys/bus/usb/devices/*/; do
@@ -72,6 +73,7 @@ for dev in /sys/bus/usb/devices/*/; do
   PLUTO_VIDPID="$(cat "$dev/idVendor"):$(cat "$dev/idProduct")"
   PLUTO_PRODUCT=$(cat "$dev/product" 2>/dev/null)
   PLUTO_SERIAL=$(cat "$dev/serial" 2>/dev/null)
+  CONFIGURED=$(cat "$dev/bConfigurationValue" 2>/dev/null)
   busnum=$(cat "$dev/busnum" 2>/dev/null)
   devnum=$(cat "$dev/devnum" 2>/dev/null)
   [ -n "${busnum:-}" ] && USB_NODE=$(printf '/dev/bus/usb/%03d/%03d' "$busnum" "$devnum")
@@ -107,17 +109,24 @@ fi
 # ------------------------------------------------------------------------------------------------
 # 3. IIO — the layer libiio actually opens
 # ------------------------------------------------------------------------------------------------
-head1 "IIO: does the radio present an IIO device?"
+head1 "IIO: can libiio open the radio?"
+# An important correction, learned the hard way on 2026-11-10: for a Pluto on USB there is NO
+# kernel IIO device, ever. The IIO protocol is spoken over libusb in user space, so
+# /sys/bus/iio/devices stays empty even when the radio is perfectly healthy. An earlier version of
+# this script treated that empty directory as failure and reported a working radio as broken.
+# The only honest test is whether libiio can produce a usb:/ip: context.
 IIO_FOUND=0
 IIO_NAMES=
 for iio in /sys/bus/iio/devices/iio:device*; do
   [ -e "$iio" ] || continue
   IIO_FOUND=1
-  name=$(cat "$iio/name" 2>/dev/null)
-  IIO_NAMES="$IIO_NAMES $name"
-  say "  $(basename "$iio"): ${name:-(unnamed)}"
+  IIO_NAMES="$IIO_NAMES $(cat "$iio/name" 2>/dev/null)"
 done
-[ "$IIO_FOUND" = 1 ] || say "  none (/sys/bus/iio/devices is empty)"
+if [ "$IIO_FOUND" = 1 ]; then
+  say "  kernel iio devices:$IIO_NAMES"
+else
+  say "  kernel iio devices: none  (expected - a USB Pluto is a user-space libiio device)"
+fi
 
 # The interesting attributes, if the phy device is there. These answer the open questions in
 # docs/ogn-rf-integration.md without needing an ogn-rf build.
@@ -143,6 +152,30 @@ for iio in /sys/bus/iio/devices/iio:device*; do
       ;;
   esac
 done
+
+# The real test: build the tiny scanner (if needed) and ask libiio what it can open.
+LIBIIO_URI=
+if [ "$PLUTO_FOUND" = 1 ]; then
+  PSRC=$HERE/../src/pluto_probe.c
+  PBIN=$HERE/../pluto_probe
+  if [ ! -r /usr/include/iio.h ]; then
+    say "  libiio scan: skipped, /usr/include/iio.h is missing (install libiio-dev)"
+  else
+    if [ ! -x "$PBIN" ] || [ "$PSRC" -nt "$PBIN" ]; then
+      gcc -O2 -w -o "$PBIN" "$PSRC" -liio -lm 2>/dev/null
+    fi
+    if [ -x "$PBIN" ]; then
+      LIBIIO_SCAN=$("$PBIN" --scan 2>/dev/null | tail -1)
+      case "$LIBIIO_SCAN" in
+        usb:*|ip:*) LIBIIO_URI=$LIBIIO_SCAN
+                    say "  libiio scan: $LIBIIO_URI  <- the radio is openable" ;;
+        *)          say "  libiio scan: nothing openable (it reported ${LIBIIO_SCAN:-nothing})" ;;
+      esac
+    else
+      say "  libiio scan: could not build the scanner (gcc or libiio-dev missing)"
+    fi
+  fi
+fi
 
 # ------------------------------------------------------------------------------------------------
 # 4. The other faces: network gadget, serial console, mass storage
@@ -240,36 +273,45 @@ fi
 # 7. Verdict
 # ------------------------------------------------------------------------------------------------
 head1 "verdict"
-if [ "$PLUTO_FOUND" = 1 ] && [ "$IIO_FOUND" = 1 ]; then
-  say "  The radio is present AND presents an IIO device. This is the good case."
-  say "  Next: ./probe-pluto.sh --capture    (a live receive check, independent of ogn-rf)"
+if [ "$PLUTO_FOUND" = 1 ] && [ -n "$LIBIIO_URI" ]; then
+  say "  The radio is present and libiio can open it. This is the working case."
+  say "  Next: ./probe-pluto.sh --capture        a live receive check, independent of ogn-rf"
+  say "        ./probe-pluto.sh --capture -v     the same, plus every attribute the AD9363 reports"
   RC=0
-elif [ "$PLUTO_FOUND" = 1 ] && [ "$MASS_STORAGE" = 1 ]; then
-  say "  The radio is on the bus but ONLY as a mass-storage volume. That is its firmware/update"
-  say "  mode, not the radio: libiio has no IIO device to open, and no rebuild can change that."
-  say "  Next: read the volume's config.txt (mount it) and set the USB mode to one that enables"
-  say "  the IIO/network function; docs/hardware.md, 'The Pluto's several USB faces'."
+elif [ "$PLUTO_FOUND" = 1 ] && [ -z "$CONFIGURED" ]; then
+  say "  The radio is on the bus but never finished configuring: bConfigurationValue is empty,"
+  say "  so no interface is live and libiio has nothing to open."
+  say "  Look at the kernel lines above for 'can't set config' or a reset right after enumeration."
+  say "  In this repository's history that was a power problem, and external power to the radio"
+  say "  fixed it - docs/status-log.md, the 11:12 entry."
+  if [ "$MASS_STORAGE" = 1 ]; then
+    say "  A storage volume did appear, so the gadget is partly up before it gives out."
+  else
+    say "  No storage volume either, so the gadget never came up at all."
+  fi
+  RC=1
+elif [ "$PLUTO_FOUND" = 1 ] && [ -n "$USB_NODE" ] && [ ! -w "$USB_NODE" ]; then
+  say "  The radio is present and CONFIGURED, but $USB_NODE is not writable by $(id -un):"
+  say "    $(ls -l "$USB_NODE" 2>/dev/null | awk '{print $1, $3, $4}')"
+  say "  libiio opens USB devices through libusb, which needs write access, so this is a"
+  say "  permissions gap and not a radio fault. One command fixes it:"
+  say "      sudo $HERE/install-pluto-udev.sh"
   RC=1
 elif [ "$PLUTO_FOUND" = 1 ]; then
-  say "  The radio is on the bus but no IIO device appeared, and no storage volume either."
-  say "  It enumerated and then either stalled or reset. Check the kernel log lines above for a"
-  say "  'device reset' or disconnect immediately after enumeration - that is a power/topology"
-  say "  problem, not a software one."
+  say "  The radio is present, configured, and this user may write its node - but libiio still"
+  say "  cannot produce a usb: context. So the IIO function on the device is not answering,"
+  say "  even though its storage function enumerated."
+  say "  Next: the device's firmware. See docs/hardware.md, 'The Pluto's several USB faces', and"
+  say "  check whether the FAT volume's config enables the IIO/network function."
   RC=1
 elif [ "$EVER_SEEN" = 1 ]; then
   say "  No Analog Devices device is on the bus now, but the kernel log shows it WAS connected."
   [ "$EVER_DISCONNECTED" = 1 ] && say "  It disconnected after enumerating - see the log above for the timestamp."
-  say "  This is the failure in docs/status-log.md: enumerate, then fall off the bus within seconds."
-  say "  It has been seen on three separate plugs. What it did NOT turn out to be:"
-  say "    - a shared power budget on a bus-powered hub. Every hub above it declares itself"
-  say "      self-powered (bmAttributes 0xE0), and the failure persisted with the RSPduo, the"
-  say "      LimeSDR and all five RTL-SDRs unplugged."
-  say "  What to try, in this order:"
-  say "    1. a DIRECT root port on the Xavier, with no hub in between - at the time of writing"
-  say "       bus 001 port 3 and every port of the bus 002 USB3 hubs are free;"
-  say "    2. a known-good, short, data-capable cable;"
-  say "    3. if it still drops with those, the remaining suspect is the radio's own supply."
-  say "  To catch the one or two seconds it lives for, watch while you replug:"
+  say "  History worth knowing before re-testing: the radio used to fall off the bus within"
+  say "  1-4 seconds on every plug, with no other device on the bus, and giving it EXTERNAL POWER"
+  say "  fixed that - it then stayed up and configured. If it is dropping again, suspect its"
+  say "  supply first."
+  say "  To catch the seconds it lives for, watch while you replug:"
   say "      $HERE/watch-pluto.sh"
   RC=1
 else
@@ -280,7 +322,7 @@ else
 fi
 
 [ "$BRIEF" = 1 ] && {
-  if [ "$PLUTO_FOUND" = 1 ] && [ "$IIO_FOUND" = 1 ]; then echo "OK" >&3; else echo "FAIL" >&3; fi
+  if [ -n "${LIBIIO_URI:-}" ]; then echo "OK" >&3; else echo "FAIL" >&3; fi
 }
 
 # ------------------------------------------------------------------------------------------------

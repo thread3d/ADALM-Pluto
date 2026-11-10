@@ -15,25 +15,27 @@ holds the scripts, measurements and documents, and one device branch in ogn-rf t
 
 ## Status
 
-Read this before anything else. **The device is not currently usable, and nothing below has yet been
-verified against live hardware.**
+Read this before anything else. **The radio is now stable on the bus, and one permissions gap stands
+between it and the first real measurement.**
 
 | Item | State |
 |---|---|
-| Device identified | **confirmed, three times** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06`, at 10:44:55, 11:02:32 and 11:09:58 |
-| Current USB link | **failing on every attempt** — three plugs, three failure modes, worst case about 1 s alive. See [`docs/status-log.md`](docs/status-log.md) |
+| Device identified | **confirmed, four times** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06` |
+| Current USB link | **stable since 11:12:41** — on **external power**. It had failed on all three bus-powered attempts, in three different ways. See [`docs/status-log.md`](docs/status-log.md) |
+| Device configured | **yes** — `bConfigurationValue = 1`; storage, network and serial functions all enumerated |
 | `libiio` runtime | **present** — 0.19-1 (Ubuntu 20.04), libusb backend compiled in |
 | `libiio` headers | **present** — `libiio-dev` 0.19-1, so a backend can be built here |
-| `iio-utils` (`iio_info`, `iio_attr`) | **missing** — not installed; `probe-pluto.sh` works without it |
-| udev rule for non-root USB access | **written, not installed** — needs one `sudo` run of `scripts/install-pluto-udev.sh` |
-| Probe (device-level, independent of ogn-rf) | **written, compiled and exercised** — fails correctly against no device; **never yet against a radio** |
+| **udev rule for non-root USB access** | **the current blocker** — `/dev/bus/usb/001/031` is `root:root` `0664`, so libusb cannot open it and libiio sees no context. One `sudo` run of `scripts/install-pluto-udev.sh` |
+| `iio-utils` (`iio_info`, `iio_attr`) | **missing** — not installed; the tools here do not need it |
+| Probe (device-level, independent of ogn-rf) | **exercised against a live radio** — which found and fixed a bug in it: it judged health by `/sys/bus/iio/devices`, always empty for a USB Pluto |
 | `adalm-pluto` branch of ogn-rf | **created and pushed** — `thread3d/ogn-rf@cbc2759`, design document only |
 | The backend itself (`plutosdr.h`) | **not started** — design only, in [`docs/ogn-rf-integration.md`](docs/ogn-rf-integration.md) |
-| Live OGN packet decoding | **not started** — cannot begin until the USB link is stable |
+| `sampling_frequency_available`, gain range, conversion scale | **not yet read** — needs the udev rule first |
+| Live OGN packet decoding | **not started** |
 
-The honest summary: the repository, the tooling and the design are in place, and the hardware is not.
-Everything that says "measured" will say so only once it was measured; nothing here is copied from a
-press release and presented as observation.
+The honest summary: the hardware now works, the tooling is verified against it, and the first
+measurements are one `sudo` away. Everything that says "measured" will say so only once it was
+measured.
 
 ## Start here
 
@@ -52,25 +54,38 @@ Step 1 is the one to run first, and it is the one that currently fails. It is de
 and needs no root: it reads the USB tree, the kernel log and the IIO sysfs, and tells you which of
 the failure modes in `docs/hardware.md` you are looking at.
 
-## The USB problem, in one paragraph
+## The USB problem, and what fixed it
 
-The Pluto has been plugged in three times and failed differently each time — which is the useful
-part. At 10:44:55 it identified itself fully, configured, presented its firmware volume, then reported
-`Power-on or device reset occurred` and dropped off the bus four seconds later. At 11:02:32 it
-enumerated and could not configure at all (`can't set config #1, error -71`, `EPROTO`), with no string
-descriptors readable. At 11:09:58, **with the RSPduo, the LimeSDR and all five RTL-SDRs unplugged**, it
-configured, bound its storage volume, and dropped again inside a second.
+The radio is now **stable**: it has been up and configured since 11:12:41 after being given
+**external power**. Before that it failed on three consecutive plugs, differently each time — and
+the third failure is the one that solved it.
 
-That last attempt is the decisive one: the radio had the bus to itself and still fell off, faster than
-before. So the host's power budget is not the cause, and neither is anything about the other devices.
-Two theories this file has had to abandon, both recorded rather than deleted: the hub was not
-bus-powered (every hub above the Pluto declares `bmAttributes 0xE0`, self-powered), and an empty bus
-did not help. What is left is physical and device-side — the cable (never yet changed), the radio's
-own supply, or its firmware — plus one host-side item never actually tried: a **direct root port**,
-since all three attempts used the same `1-4.4.3` behind two hubs. Bus 001 port 3 is free now.
-`docs/status-log.md` has the kernel lines, the descriptor table and the per-attempt comparison.
-`scripts/watch-pluto.sh` exists because the device now lives about a second, which is too short to
-inspect by hand.
+At 10:44:55 it identified itself, configured, presented its firmware volume, then reported
+`Power-on or device reset occurred` and dropped four seconds later. At 11:02:32 it enumerated and
+could not configure at all (`can't set config #1, error -71`, `EPROTO`). At 11:09:58, **with the
+RSPduo, the LimeSDR and all five RTL-SDRs unplugged**, it configured and dropped again inside a
+second.
+
+That third attempt was the decisive one: with the radio alone on the bus it still fell off, which
+ruled out the host's power budget and left the radio's own supply as the surviving explanation. On
+external power it has not dropped once. The cable was never changed and did not need to be.
+
+Two intermediate theories are recorded in `docs/status-log.md` rather than deleted, because both
+looked right at the time: that the hub was bus-powered (it declares `bmAttributes 0xE0`,
+self-powered, at every level), and that the port shared a current budget with the other SDRs (an
+empty bus did not help). The mechanism was not shared current — it was that this port, behind two
+hubs, could not feed the 500 mA the radio asks for. `scripts/watch-pluto.sh` exists because the
+failing device lived one to four seconds, which is far too short to inspect by hand; it sampled ten
+times a second and is what showed the transition from `UNCONFIGURED` to `CONFIGURED as value 1`.
+
+**One blocker remains**, and it is not the radio: `/dev/bus/usb/001/031` is `root:root` `0664`, so
+libusb cannot open it as `threaded` and libiio sees no context. That needs one `sudo` run of
+`scripts/install-pluto-udev.sh`.
+
+That same episode exposed a bug in this repository's own probe, now fixed: it judged health by
+`/sys/bus/iio/devices`, which for a USB Pluto is **always empty**, because IIO-over-USB is a
+user-space protocol and no kernel driver is involved. It would have called a working radio broken
+forever. The test is now whether libiio can produce a `usb:` context.
 
 ## Why this radio is different
 

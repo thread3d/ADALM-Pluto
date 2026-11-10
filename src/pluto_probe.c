@@ -134,6 +134,42 @@ static void list_contexts(void)
     iio_scan_context_destroy(sc);
 }
 
+/* Scan for a context that could be a radio: usb: first, then ip:. Returns a malloc'd URI, or NULL.
+ *
+ * This is the only honest health test for a Pluto over USB. The kernel creates no iio:device for
+ * it - the IIO protocol runs over libusb in user space - so /sys/bus/iio/devices stays empty even
+ * when the radio is perfectly healthy, and a check that looks there is checking the wrong thing.
+ *
+ * Note what a NULL result does and does not mean: libiio's scan only reports contexts it can
+ * actually open, so an unreadable USB node (no udev rule) and an absent device produce the same
+ * empty list. Distinguishing them is the caller's job, which is why probe-pluto.sh looks at the
+ * node permissions separately. */
+static char *scan_for_context(int show_list)
+{
+    char *found = NULL;
+    struct iio_scan_context *sc = iio_create_scan_context(NULL, 0);
+    struct iio_context_info **info = NULL;
+    ssize_t n = sc ? iio_scan_context_get_info_list(sc, &info) : -1;
+
+    if (n > 0) {
+        for (ssize_t k = 0; k < n && !found; k++)
+            if (!strncmp(iio_context_info_get_uri(info[k]), "usb:", 4))
+                found = strdup(iio_context_info_get_uri(info[k]));
+        for (ssize_t k = 0; k < n && !found; k++)
+            if (!strncmp(iio_context_info_get_uri(info[k]), "ip:", 3))
+                found = strdup(iio_context_info_get_uri(info[k]));
+        if (show_list) {
+            printf("libiio %s sees %zd context(s):\n", libiio_version(), n);
+            for (ssize_t k = 0; k < n; k++)
+                printf("  %-24s %s\n", iio_context_info_get_uri(info[k]),
+                       iio_context_info_get_description(info[k]));
+        }
+    }
+    if (info) iio_context_info_list_free(info);
+    if (sc) iio_scan_context_destroy(sc);
+    return found;
+}
+
 static void describe_context(struct iio_context *ctx)
 {
     unsigned int maj = 0, min = 0;
@@ -279,6 +315,7 @@ int main(int argc, char **argv)
     long     want = 2000000;
     const char *outpath = NULL;
     int shift = 4;
+    int scan_only = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-u")) uri = opt(argc, argv, &i);
@@ -293,8 +330,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-o")) outpath = opt(argc, argv, &i);
         else if (!strcmp(argv[i], "-s")) shift = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-v")) verbosity++;
+        else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--scan")) scan_only = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [-u URI] [-f HZ] [-r HZ] [-g DB|auto] [-n N] [-o FILE] [-s SHIFT] [-b HZ] [-v]\n", argv[0]);
+            printf("       %s --scan      list contexts; exit 0 only if a usb:/ip: radio is openable\n", argv[0]);
             printf("       %s -u usb:1.4.4.3 -f 868200000 -r 4000000 -g 40 -n 2000000 -o 868.u8\n", argv[0]);
             printf("\nSee scripts/probe-pluto.sh, which builds and calls this.\n");
             return 0;
@@ -305,24 +344,20 @@ int main(int argc, char **argv)
     printf("pluto_probe %s, libiio %s\n", VERSION, libiio_version());
     if (shift < 0 || shift > 15) { fprintf(stderr, "shift must be 0..15\n"); return 2; }
 
+    if (scan_only) {
+        /* Machine-readable answer to "is a radio openable right now?", for probe-pluto.sh. */
+        char *found = scan_for_context(1);
+        printf("%s\n", found ? found : "NONE");
+        free(found);
+        return found ? 0 : 1;
+    }
+
     if (!uri) {
         /* Default: the first usb: context, or failing that the first ip: one. The "local" backend is
          * deliberately never chosen: libiio always offers it on any host, so falling back to it would
          * mean opening a context with no radio in it and reporting a confusing "no ad9361-phy" from a
          * device that is simply not there. */
-        struct iio_scan_context *sc = iio_create_scan_context(NULL, 0);
-        struct iio_context_info **info = NULL;
-        ssize_t n = sc ? iio_scan_context_get_info_list(sc, &info) : -1;
-        if (n > 0) {
-            for (ssize_t k = 0; k < n && !uri; k++)
-                if (!strncmp(iio_context_info_get_uri(info[k]), "usb:", 4))
-                    uri = strdup(iio_context_info_get_uri(info[k]));
-            for (ssize_t k = 0; k < n && !uri; k++)
-                if (!strncmp(iio_context_info_get_uri(info[k]), "ip:", 3))
-                    uri = strdup(iio_context_info_get_uri(info[k]));
-        }
-        if (info) iio_context_info_list_free(info);
-        if (sc) iio_scan_context_destroy(sc);
+        uri = scan_for_context(0);
         if (uri) printf("no -u given; using the context the scan found: %s\n", uri);
     }
 
