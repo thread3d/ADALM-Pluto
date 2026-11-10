@@ -128,11 +128,11 @@ software step is unavoidable if ogn-rf is to run at exactly 2.0. The cost of eac
 
 | Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
 |---|---|---|---|---|---|
-| 2 083 333 | **÷12** | none — but the rate is 2.0833, not 2.0 | 2 083 333 | 8 MB/s | needs ogn-rf at a non-round rate: `SpectrogramFFTsize` becomes 1066, not 1024 |
-| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | safest — most USB headroom for other radios |
-| **6 000 000** | ÷8 | **÷3 box** | **2 000 000** | **23 MB/s** | **highest decimation that works** — see below |
-| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | **loses ~4 % of samples** — see the measured grid below |
-| 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | link delivers 8 MSPS, not 61 |
+| **2 083 334** | **÷12** | **none** | **2 081 065** | **8 MB/s** | **best** — the device does all of it, lightest load; only cost is that 2.083 ≠ 2.000 |
+| 4 000 000 | ÷8 | ÷2 box | 1 997 777 | 15 MB/s | exact 2.0 MSPS, identical delivery, twice the USB |
+| 6 000 000 | ÷8 | ÷3 box | 1 997 986 | 23 MB/s | exact 2.0 MSPS, no delivery advantage over ÷2 |
+| 8 000 000 | ÷8 | ÷4 box | ~1 950 000 | 31 MB/s | **flaky — drops 2–5 % of samples** |
+| 61 440 000 | ÷8 | ÷32 box | — | 245 MB/s needed | the link delivers ~8 MSPS; real output falls under 1 MSPS |
 
 Any of these lands on ogn-rf's natural rate for a reason that is not arbitrary: **8 × 2 000 000 /
 15 625 = 1024 exactly**, so the spectrogram is a power-of-two FFT as its author intended. At
@@ -153,56 +153,57 @@ The averaged stream is ~1/√2 of the input as a box filter over independent noi
 crest factor holds, and nothing clips. The box filter is the same shape as ogn-rf's own
 `boxfilter.h`.
 
-### How far the decimation can go: 6 MSPS ÷ 3 is the ceiling
+### How far the decimation can go
 
-Every chip rate that divides exactly to 2.0 MSPS, each captured for at least 2 seconds of data:
+Three ways to reach ~2 MSPS, each captured for whole blocks totalling ≥2 s of data, repeated three
+times:
 
-| Chip rate | Decim | Delivered | Overhead | Real output rate | Verdict |
-|---|---|---|---|---|---|
-| 4 000 000 | ÷2 | 98.4 % | +33 ms | 1.968 MSPS | clean |
-| **6 000 000** | **÷3** | **99.4 %** | **+12 ms** | **1.988 MSPS** | **clean — the best of them** |
-| 8 000 000 | ÷4 | 95.8 % | +86 ms | 1.930 MSPS | **loses ~4 %** |
-| 10 000 000 | ÷5 | 78.0 % | +563 ms | 1.561 MSPS | loses 22 % |
-| 12 000 000 | ÷6 | 65.3 % | +1063 ms | 1.306 MSPS | loses 35 % |
-| 16 000 000 | ÷8 | 48.6 % | +2113 ms | 0.973 MSPS | loses 51 % |
+| Chip rate | Decim | Software | Delivered | Overhead | Into ogn-rf | USB | Verdict |
+|---|---|---|---|---|---|---|---|
+| **2 083 334** | **÷1** | **none** | **99.8–99.9 %** | +2–4 ms | **2.081 MSPS** | **8.3 MB/s** | **clean** |
+| 4 000 000 | ÷2 | ÷2 box | 99.9 % | +2–3 ms | 1.998 MSPS | 15 MB/s | clean |
+| 6 000 000 | ÷3 | ÷3 box | 99.9 % | +2–3 ms | 1.998 MSPS | 23 MB/s | clean |
+| 8 000 000 | ÷4 | ÷4 box | 95.2–98.3 % | +35–103 ms | 1.93–1.97 MSPS | 31 MB/s | **flaky — drops samples** |
+| 10 000 000 | ÷5 | ÷5 box | 78.8 % | +542 ms | 1.58 MSPS | over capacity | loses 21 % |
+| 12 000 000 | ÷6 | ÷6 box | 65.8 % | +1045 ms | 1.32 MSPS | over capacity | loses 34 % |
+| 16 000 000 | ÷8 | ÷8 box | 49.5 % | +2054 ms | 0.99 MSPS | over capacity | loses 50 % |
 
-The borderline three repeated three times each, because one run is not evidence:
+**The first row is what the chip can do on its own, and it is the best one.** At `2 083 334` the AD9363
+runs its ADC at 25 MHz and decimates by 12 internally; USB then carries **2.081 MSPS at 8.3 MB/s and
+the host does no resampling at all**. That is the lightest possible load for a ~2 MSPS stream, and it
+is the only configuration with no software step.
 
-```
-4 MSPS /2 : 98.4%/+33ms ok    98.3%/+34ms ok    98.4%/+33ms ok
-6 MSPS /3 : 99.4%/+12ms ok    99.4%/+12ms ok    99.4%/+12ms ok
-8 MSPS /4 : 96.1%/+81ms LOSS  95.9%/+85ms LOSS  95.6%/+92ms LOSS
-```
+The ceiling is between 6 and 8 MSPS. 8 MSPS is right at what the link carries and behaves
+inconsistently — 98.3 % in one run, 95.2–95.6 % in three others. For ogn-rf, a stream that sometimes
+drops 5 % of its samples is worse than a slower one that never does, because a time slot with holes
+does not decode.
 
-So **6 MSPS ÷ 3 is the highest decimation that still delivers exactly 2.0 MSPS**, and it is not a
-marginal case: 99.4 % delivered with 12 ms of overhead, reproducible. 8 MSPS sits on the edge of what
-the link carries and drops about 4 % of samples — and a stream with holes in it is worse for ogn-rf
-than a slower one, because a time slot that is missing samples does not decode.
+Above 8 MSPS the requested rate is not delivered at all, and the real output rate *falls*: 10, 12 and
+16 MSPS requests produce 1.58, 1.32 and 0.99 MSPS. **Asking for more makes the receiver slower.**
 
-Above 8 MSPS the requested rate is simply not delivered: the real output rate falls to 1.56 / 1.31 /
-0.97 MSPS for requests of 10 / 12 / 16 MSPS. Asking for a higher rate makes the receiver *slower*,
-which is the opposite of the intuition that started this test.
+### Why a high ADC rate with a low output rate is not possible here
 
-### Telling buffering latency from lost samples
+The natural idea — run the converter fast and decimate hard, so USB only ever sees 2 MSPS — is right
+about the mechanism (`sampling_frequency` *is* the post-decimation rate) and wrong about the tuning:
+**the ADC clock is not independently settable.** `rx_path_rates` shows the driver choosing it from the
+requested output rate, at a fixed ÷8 above the floor:
 
-A short capture reads below 100 % for a reason that is not loss, and getting this wrong makes a
-healthy link look broken — the probe did exactly that for a while:
+| Output rate | ADC clock | Internal chain | ADC ÷ out |
+|---|---|---|---|
+| 2 083 333 | **25.0 MHz** | ÷3 ÷2 ÷2 | **÷12** |
+| 4 000 000 | 32.0 MHz | ÷2 ÷2 ÷2 | ÷8 |
+| 6 000 000 | 48.0 MHz | ÷2 ÷2 ÷2 | ÷8 |
+| 8 000 000 | 64.0 MHz | ÷2 ÷2 ÷2 | ÷8 |
+| 61 440 000 | 491.52 MHz | ÷2 ÷2 ÷2 | ÷8 |
 
-```
-wall = n / rate + L          L is a fixed startup latency  -> the shortfall SHRINKS with length
-wall = n / (k x rate)        k < 1, samples dropped        -> the shortfall is CONSTANT
-```
+There is no ÷30 chain, so 60 MSPS of ADC cannot feed a 2 MSPS output; and asking for 60 MSPS *output*
+demands 245 MB/s from a link that measures ~31. The ÷12 at the floor is the chip's maximum useful
+decimation, and it is why the output rate cannot go below 2 083 333 Hz.
 
-Measured at 4 MSPS: 95.2 % over 0.5 s and 98.4 % over 2 s — the same ~33 ms of latency, not a bigger
-loss. At 10 MSPS the excess *grew* with length (0.162 s over 0.6 s of data, 0.328 s over 1.2 s),
-which is loss. So the probe now reports overhead in milliseconds and only declares loss when the
-capture is long enough (≥1.5 s of data) for a fixed latency to be small.
-
-One more caveat worth carrying: **that ~31 MB/s ceiling is shared with every other SDR on this
-board.** The RSPduo, the LimeSDR and five RTL-SDRs were unplugged for these measurements. 6 MSPS
-÷ 3 uses 23 MB/s of the ~31, leaving little room for anything else; 4 MSPS ÷ 2 uses 15 MB/s and
-leaves twice the headroom for the same 2.0 MSPS output. If other radios are streaming at the same
-time, 4 ÷ 2 is the safer choice.
+It would not help even if it were possible: at maximum gain the receive noise is rms 12–18 counts
+against a 2048 full scale, while 12-bit quantisation noise is about **0.29 counts**. The chain is
+analogue-noise-limited by a factor of ~50, so oversampling and extra on-chip decimation recover no
+SNR at all.
 
 ### Gain: measured, and the law is not a straight line
 

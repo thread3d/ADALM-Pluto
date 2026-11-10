@@ -395,3 +395,82 @@ hearing aircraft — and nothing needs to be fixed about that.
 The rate, the gain range, the format and the frequency trim are now measured rather than inferred,
 which is everything the `plutosdr.h` design was waiting on. The next piece of work is the backend
 itself, and the first thing it does when it runs is compare its own output with the numbers above.
+
+---
+
+## 2026-11-10 (later) — let the radio do all the decimation
+
+Asked whether the Pluto could decimate harder so that only ~2 MSPS ever crosses USB. The answer is
+yes, and it is now the shipped configuration — but the measurement took three attempts to get right,
+and the corrections are more useful than the number.
+
+### What the chip does on its own
+
+`ChipRate = 2083334`, `Decimate = 1`: the AD9363 runs its ADC at **25 MHz** and decimates by 12
+internally (`R2 ÷3, R1 ÷2, RFIR ÷2`), so:
+
+```
+applied   868399998 Hz at 2083333 Hz
+RX path rates: ADC 25000007  R2 8333335  R1 4166667  RF 2083333  RXSAMP 2083333
+4194304 samples (2.013 s), chip rate 99.9% delivered, overhead +3 ms
+throughput 2.080 Msps sustained (8.3 MB/s)
+rms 0.6 %FS, crest 5.57, clipped 0  -> PASS
+```
+
+**No software resampling at all, and the lightest USB load of any ~2 MSPS configuration.** The host
+receives 2.081 MSPS and ogn-rf's DSP consumes it directly. The only cost is that 2.0833 ≠ 2.000:
+`SpectrogramFFTsize = 8·2083333/15625` is 1066 rather than 1024.
+
+### Why "60 MSPS into the chip, 2 MSPS out" is not reachable
+
+Not a tuning problem — a structural one. `sampling_frequency` *is* the post-decimation rate, so the
+mechanism is right, but **the ADC clock is not independently settable**: the driver derives it from the
+requested output rate at a fixed ÷8, and ÷12 only at the floor. Measured: 25 MHz ADC for 2.083 MSPS
+out, 32 for 4, 48 for 6, 64 for 8, 491.52 for 61.44. There is no ÷30 chain, so 60 MSPS of converter
+cannot feed a 2 MSPS output; and asking for 60 MSPS *output* needs 245 MB/s from a link that measures
+~31.
+
+It would buy nothing either. At maximum gain the noise is rms 12–18 counts of a 2048 full scale, while
+12-bit quantisation noise is ~0.29 counts: the chain is analogue-noise-limited by ~50×, so extra
+oversampling and on-chip decimation recover no SNR.
+
+### Three measurement bugs in this repository's own probe
+
+Every one of them made a *good* configuration look bad, and all three surfaced only because the
+numbers were cross-checked against each other:
+
+1. **A single huge `iio_buffer`** made the probe report throughput *above* the requested rate — 145 %
+   of 4 MSPS. `iio_buffer_end()` marks the end of the allocation, not what a refill filled, so the
+   walk read stale samples past the valid region. Now it reads 262144-sample blocks and refills,
+   which is also how ogn-rf will read.
+2. **Buffering latency was reported as sample loss.** A short capture reads below 100 % for reasons
+   that are not loss. The probe now reports overhead in milliseconds and only declares loss when the
+   capture is long enough for a fixed latency to be a small part of it.
+3. **The tail block was charged as loss.** `want` was not a multiple of the block size, so the last
+   refill transferred a full block while only its remainder was counted — one block-time of
+   unaccounted transfer, which at 2.083 MSPS is 126 ms and at 8 MSPS only 33 ms. It therefore
+   penalised exactly the *lightest* USB load most, and made 2.083 MSPS read 94 % (FAIL) while 23 MB/s
+   read 99 %. Captures are now a whole number of blocks.
+
+With all three fixed, the corrected grid (three repeats per row, ≥2 s of data):
+
+```
+2.083 MSPS /1 : 99.8%/+4ms   99.9%/+2ms   99.9%/+2ms    clean    8.3 MB/s
+4 MSPS     /2 : 99.9%/+3ms   99.9%/+2ms   99.9%/+2ms    clean   15.0 MB/s
+6 MSPS     /3 : 99.9%/+3ms   99.9%/+3ms   99.9%/+2ms    clean   23.0 MB/s
+8 MSPS     /4 : 95.2%        95.6%        95.3%         DROPS SAMPLES
+10 MSPS    /5 : 78.8%   -> real output collapses to 1.58 MSPS
+16 MSPS    /8 : 49.5%   -> real output collapses to 0.99 MSPS
+```
+
+**This overturns the previous entry's conclusion.** 6 MSPS ÷ 3 was reported as "the ceiling, and best
+on every criterion" on a metric that was penalising the low-rate rows. On the corrected metric the
+three clean rows are indistinguishable at 99.9 %, so the choice is not about delivery at all — it is
+about *where the last factor happens*: on the chip (2.083 MSPS, 8.3 MB/s, no software) or in software
+(exactly 2.0 MSPS, 15–23 MB/s). 8 MSPS, previously called "clean" in one run at 98.3 %, is flaky and
+drops 2–5 %.
+
+The shipped config now takes the first option, since it is both the lightest load and the one that
+asks least of the host. It costs a 4 % difference in rate, and if ogn-rf's demodulator turns out to
+want exactly 2.000 MSPS the fallback is one line: `ChipRate = 4000000`, `Decimate = 2`,
+`SampleRate = 2000000`.

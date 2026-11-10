@@ -502,6 +502,12 @@ int main(int argc, char **argv)
      * actually filled - so the walk was reading stale samples past the valid region. Blocks make
      * "samples read" mean "samples the link delivered". */
     size_t bufsz = (size_t)want < 262144 ? (size_t)want : 262144;
+    /* Capture a whole number of blocks. Otherwise the last refill transfers a full block while only
+     * its remainder is counted, and the unaccounted tail - one block-time, 126 ms at 2.083 MSPS but
+     * only 33 ms at 8 - is charged to the run as though it were lost samples. Two earlier versions of
+     * this timing were wrong in exactly that direction: they made the lightest USB load look like the
+     * lossiest. Round the request down instead. */
+    if (want > (long)bufsz) want = ((long)want / (long)bufsz) * (long)bufsz;
     struct iio_buffer *buf = iio_device_create_buffer(p.rx, bufsz, false);
     if (!buf) {
         fprintf(stderr, "cannot create a %zu-sample buffer\n", bufsz);
@@ -516,7 +522,7 @@ int main(int argc, char **argv)
 
     printf("\ncapturing %ld samples in %zu-sample blocks...\n", want, bufsz);
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    memset(&t0, 0, sizeof(t0));
 
     const ptrdiff_t step = iio_buffer_step(buf);
 
@@ -545,6 +551,14 @@ int main(int argc, char **argv)
     while (n < want) {
         if (iio_buffer_refill(buf) < 0) break;
         refills++;
+        /* The FIRST block is priming, and is not timed or counted.
+         *
+         * Its fill takes a whole block-time - 126 ms at 2.083 MSPS, 33 ms at 8 - because the device
+         * has to produce it from empty. Including it charges the run for a start-up cost that scales
+         * as 1/rate, which made the LIGHTEST USB load (2.083 MSPS, 7.9 MB/s) look like the lossiest
+         * and the heaviest look clean. Timing steady state instead: from one full block to the next
+         * the device must have produced exactly the samples consumed. */
+        if (refills == 1) { clock_gettime(CLOCK_MONOTONIC, &t0); continue; }
         char *pi = iio_buffer_first(buf, p.i);
         char *pq = iio_buffer_first(buf, p.q);
         char *end = iio_buffer_end(buf);
@@ -584,7 +598,8 @@ int main(int argc, char **argv)
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    const double wall = (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec);
+    const double wall = t1.tv_sec || t1.tv_nsec
+        ? (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec) : 0.0;
     const double achieved = wall > 0 ? (double)n / wall : 0.0;
 
     iio_channel_disable(p.i);
