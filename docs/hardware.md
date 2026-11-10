@@ -188,7 +188,29 @@ A crest factor of 4.2–5.2 through that sweep is **normal, not compression**: i
 Gaussian sample divided by its rms over 300k samples, which sits near 4.5. The RSPduo repository's
 "9–11 is healthy, 3–5 is folding" figure came from a different measurement and does not transfer.
 
-### S/N: gain is the only knob that matters, and it saturates around 65 dB
+### Gain for range: maximum, because sensitivity is still improving at 73 dB
+
+The headline figures above were measured on the noise floor at 868.4 MHz. Re-measured **on the OGN
+channel itself** (LO 868.2 MHz, 600 kHz filter) the answer is cleaner and it changes the setting:
+
+| gain | noise density (dBFS/Hz) | input-referred |
+|---|---|---|
+| 55 | −119.61 | −174.61 |
+| 60 | −115.50 | −175.50 |
+| 63 | −112.61 | −175.61 |
+| 66 | −110.52 | −176.52 |
+| 70 | −106.96 | −176.96 |
+| **73** | −104.13 | **−177.13** |
+
+The curve flattens but **never turns**: the noise figure is still improving at maximum gain, and 63 → 73
+dB is worth **1.5 dB**, i.e. about 19 % more free-space range for a weak signal. For a receiver whose
+purpose is distant aircraft, that is the number to take.
+
+The counterweight is brief clipping on the local ISM bursts, which is milliseconds against a 0.85 s
+time slot — negligible beside a permanent 1.5 dB. So: **maximum gain**, and the earlier choice of 63 dB
+had optimised against the wrong cost.
+
+### S/N: gain is the only knob that matters
 
 S/N cannot be read off time-domain statistics — rms over a capture mixes signal and noise into one
 number. The probe therefore gained a Welch spectrum analyser (`-S`, Hann-windowed, 32 segments of
@@ -209,10 +231,10 @@ Measured at 868.400 MHz, 2 MSPS, 4 MHz bandwidth, three repeats each — reprodu
 | 70 | −106.15 | −176.15 |
 | **73** | −103.35 | **−176.35** |
 
-The improvement is steep up to ~55 dB and then flattens hard: the last 18 dB of gain (55 → 73) buys
-**2.25 dB** of sensitivity, and the last 3 dB (70 → 73) buys 0.20 dB. In other words the noise figure
-saturates near 65 dB and there is nothing to win above it — but nothing to lose either, on a quiet
-band.
+The improvement is steep up to ~55 dB and then flattens: the last 18 dB of gain (55 → 73) buys
+**2.25 dB** of sensitivity, and the last 3 dB (70 → 73) buys 0.20 dB. Note it *flattens but does not
+turn* — there is still something to win at the top, which is why the shipped gain is the maximum. See
+"Gain for range" below, where the same curve measured on the OGN channel gives 1.5 dB for 63 → 73.
 
 **Everything else is flat.** Same conditions, noise density in dBFS/Hz:
 

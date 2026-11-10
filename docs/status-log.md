@@ -707,3 +707,51 @@ lasts milliseconds against a 0.85 s time slot — and is recorded as the quiet-s
 The lasting answer is a **software gain guard**: measure the crest factor and a saturate counter,
 step the manual gain down when they trip, and log it. That is the protection AGC provides, minus the
 hunting, and with a gain history the demodulator can be told about.
+
+---
+
+## 2026-11-10 — high gain is right for range, and the previous entry was optimising the wrong cost
+
+The receiver's job here is distant, over-the-horizon aircraft, so the question "is high gain good or
+bad" is really "does gain buy sensitivity, and what does it cost".
+
+**It buys sensitivity all the way to the top.** Measured on the OGN channel itself (LO 868.2 MHz,
+600 kHz filter), input-referred noise = noise density − gain:
+
+| gain | density dBFS/Hz | input-referred |
+|---|---|---|
+| 55 | −119.61 | −174.61 |
+| 60 | −115.50 | −175.50 |
+| 63 | −112.61 | −175.61 |
+| 66 | −110.52 | −176.52 |
+| 70 | −106.96 | −176.96 |
+| 73 | −104.13 | **−177.13** |
+
+Monotonic, and consistent with the earlier 868.4 sweep (−174.10 at 55 dB to −176.35 at 73). The noise
+figure is **still improving at maximum gain**; the curve flattens but never turns. Going from 63 to
+73 dB is worth **1.5 dB**, which for a weak signal is about 19 % more free-space range.
+
+**What it costs is brief clipping.** The band has carriers at 868.09 / 868.84 / 868.93 MHz up to 78 dB
+above the floor, and sporadic bursts that clip the ADC at 70–73 dB — observed twice in roughly twenty
+minutes of monitoring. Weigh that against a permanent 1.5 dB: a clipped burst lasts milliseconds and
+costs a sliver of one 0.85 s slot, while the sensitivity applies to every slot forever.
+
+So the shipped gain is back to **73 dB**, and the 63 dB chosen in the previous entry — which existed to
+avoid clipping — was optimising against the wrong cost. Choosing the gain to protect the ADC made
+sense when the goal was a stable bench measurement; it does not when the goal is hearing something
+very far away.
+
+**The corollary is what actually buys range, and it is not this number:** an LNA at the antenna and a
+short low-loss feedline. Any loss ahead of the receiver adds straight into the system noise figure, and
+the gain control downstream cannot recover it. This radio has no bias tee (measured), so an LNA needs
+its own supply or a bias-T injector.
+
+### On "the Pluto is the most sensitive of my receivers"
+
+Not established, and the recorded numbers cannot establish it. The sibling repos hold
+dBFS/Hz noise floors for the RSPduo (−71.8) and the LimeSDR (−88.1 to −88.9) against the Pluto's
+−104, but those are relative to **different full-scale references** — 8-bit, 14-bit-in-16-bit and
+12-bit respectively — at different gains and bandwidths. Comparing them directly would be exactly the
+apples-to-oranges error this repository keeps catching. Settling it needs the same antenna, the same
+band, and either a calibrated noise source or the same known signal measured on each receiver, which
+means plugging the others back in one at a time.
