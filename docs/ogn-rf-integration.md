@@ -150,28 +150,42 @@ existing `tools/spectrum.py`: inject a known-level signal, sweep gain, and pick 
 the full 8-bit range without clipping. Until then the backend takes a constant, and the constant is
 documented at its definition as provisional.
 
-### Rate: the AD9363 will not go where ogn-rf wants to go
+### Rate: the chip decimates on-chip already, and USB is the real ceiling
 
-This is the constraint that shapes the backend. The chip's decimating filters bottom out at about
-2.08 MSPS, while ogn-rf asks for 1.0 MSPS by default and 2.048 MSPS by inheritance from the RTL-SDR.
-Neither is reachable.
+The intuition worth correcting here: it is natural to think the right move is to run the Pluto at its
+maximum sample rate and let its internal decimator hand 2 MSPS to ogn-rf. Measured, that is backwards
+on both counts, and `docs/hardware.md` has the tables.
 
-The `setOversample()` hook already exists on the RSPduo branch for exactly this class of problem, so
-the design is to use it:
+**`sampling_frequency` is the post-decimation output rate, and the chip filters on every setting.**
+`rx_path_rates` shows the chain it picks: at 4 MSPS the ADC runs at 32 MHz with HB3 ÷2, HB2 ÷2 and the
+RX FIR ÷2 (÷8 overall); at 61.44 MSPS the ADC runs at 491.52 MHz with the *same* ÷8. Only the minimum
+data rate gets the extra ÷12. So a higher rate raises the ADC clock and the USB traffic and changes
+nothing else.
 
-| ogn-rf asks for | chip runs at | software decimation | USB traffic | notes |
-|---|---|---|---|---|
-| 2 000 000 | 4 000 000 | ÷2 | 16 MB/s | **the intended default** — clean integer ratio, comfortable on 480 Mbit/s |
-| 2 000 000 | 8 000 000 | ÷4 | 32 MB/s | more headroom against aliasing, more than half of USB2 |
-| 1 000 000 | 8 000 000 | ÷8 | 32 MB/s | only if 1 Msps is actually wanted |
-| 2 083 333 | 2 083 333 | ÷1 | 8 MB/s | ask ogn-rf to match the chip instead; least USB pressure, non-integer relationship to the OGN symbol clock |
+**USB saturates near 8 MSPS / 31 MB/s.** Measured sustained: 2.03 Msps for a 2.08 MSPS request,
+3.85 for 4, 7.66 for 8 — and requests for 15.36, 30.72 and 61.44 MSPS all delivered about 8 Msps and
+31 MB/s. The chip accepts the rate; the link drops the rest. USB 2.0's theoretical 60 MB/s, halved by
+protocol overhead and two hubs, is the ceiling.
 
-The first row is the recommendation: it lands on the **same 2.0 MSPS the RSPduo work settled on**, so
-the frequency plan and the gain measurements from that work stay comparable, and the decimation is a
-2-tap box filter — `boxfilter.h` is already in the tree.
+So `setOversample()` is not about buying headroom from the chip's decimator — it is about landing on
+the rate ogn-rf's DSP wants while staying well inside what USB can carry:
 
-Which of these is right is not settled, and cannot be settled without a radio: it depends on the
-chip's actual rate floor on this firmware and on what the decimator does to the OGN pulse shape.
+| Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
+|---|---|---|---|---|---|
+| 2 083 333 | **÷12** | none, but the rate is 2.0833 | 2 083 333 | 8 MB/s | `SpectrogramFFTsize` becomes 1066 and every rate-dependent constant shifts 4 % |
+| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | **the choice** — exact rate, 4x USB headroom |
+| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | at the USB ceiling for no gain |
+| 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | the link delivers 8 MSPS |
+
+The tie-breaker is arithmetic that is not arbitrary: **8 x 2 000 000 / 15 625 = 1024 exactly**, so
+ogn-rf's spectrogram is the power-of-two FFT it was written for. At 2 083 333 the same expression gives
+1066, and at the RTL-SDR's 2 048 000 it gives 1048 — so 2.0 MSPS is the rate ogn-rf actually wants,
+and hitting it exactly is worth one box filter.
+
+Validated with the ÷2 stage implemented in the probe (`-r 4000000 -D 2`): 1 000 000 samples out at
+exactly 2 000 000 Hz; rms 0.7 %FS against 0.8 %FS undecimated (the ~1/√2 a box filter over
+independent noise should give), crest 5.02, nothing clipped. The filter is the same shape as ogn-rf's
+own `boxfilter.h`.
 
 ## Configuration
 

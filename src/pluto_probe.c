@@ -44,6 +44,7 @@
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #include <iio.h>
 
 #ifndef VERSION
@@ -310,6 +311,8 @@ static void describe_phy(struct phy *p)
     }
     print_attr_any(p->rx0, p->dev, "gain_control_mode",           "gain mode");
     print_attr_any(p->rx0, p->dev, "gain_control_mode_available", "gain modes available");
+    print_attr_any(NULL,   p->dev, "rx_path_rates",               "RX path rates");
+    print_attr_any(NULL,   p->dev, "trx_rate_governor",           "rate governor");
     print_attr_any(NULL,   p->dev, "xo_correction",               "xo correction");
     print_attr_any(NULL,   p->dev, "xo_correction_available",     "xo correction available");
     if (p->lo) print_attr(p->lo, NULL, "frequency",  "LO now");
@@ -357,6 +360,7 @@ int main(int argc, char **argv)
     const char *outpath = NULL;
     int shift = 4;
     int scan_only = 0;
+    int decim = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-u")) uri = opt(argc, argv, &i);
@@ -372,8 +376,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-s")) shift = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-v")) verbosity++;
         else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--scan")) scan_only = 1;
+        else if (!strcmp(argv[i], "-D")) decim = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("usage: %s [-u URI] [-f HZ] [-r HZ] [-g DB|auto] [-n N] [-o FILE] [-s SHIFT] [-b HZ] [-v]\n", argv[0]);
+            printf("usage: %s [-u URI] [-f HZ] [-r HZ] [-g DB|auto] [-n N] [-o FILE] [-s SHIFT] [-b HZ] [-D N] [-v]\n", argv[0]);
+            printf("       -D N   decimate by N in software after the chip, e.g. -r 4000000 -D 2 = 2.0 MSPS out\n");
             printf("       %s --scan      list contexts; exit 0 only if a usb:/ip: radio is openable\n", argv[0]);
             printf("       %s -u usb:1.4.4.3 -f 868200000 -r 4000000 -g 40 -n 2000000 -o 868.u8\n", argv[0]);
             printf("\nSee scripts/probe-pluto.sh, which builds and calls this.\n");
@@ -384,6 +390,7 @@ int main(int argc, char **argv)
 
     printf("pluto_probe %s, libiio %s\n", VERSION, libiio_version());
     if (shift < 0 || shift > 15) { fprintf(stderr, "shift must be 0..15\n"); return 2; }
+    if (decim < 1 || decim > 64) { fprintf(stderr, "-D (decimation) must be 1..64\n"); return 2; }
 
     if (scan_only) {
         /* Machine-readable answer to "is a radio openable right now?", for probe-pluto.sh. */
@@ -457,15 +464,22 @@ int main(int argc, char **argv)
     }
 
     /* Read back what the hardware actually took: this is the honest answer, not what we asked for. */
-    long long got_rate = 0, got_freq = 0, got_gain = 0;
+    long long got_rate = 0, got_freq = 0, got_gain = 0, got_bw = 0;
     int have_rate = p.rx0 && read_ll(p.rx0, NULL, "sampling_frequency", &got_rate) == 0;
     int have_freq = p.lo  && read_ll(p.lo,  NULL, "frequency", &got_freq) == 0;
     int have_gain = p.rx0 && read_ll(p.rx0, NULL, "hardwaregain", &got_gain) == 0;
-    printf("  requested %u Hz at %u Hz\n", freq, rate);
+    int have_bw   = p.rx0 && read_ll(p.rx0, NULL, "rf_bandwidth", &got_bw) == 0;
+    printf("  requested %u Hz at %u Hz%s%s\n", freq, rate,
+           bw ? ", bandwidth " : "", bw ? "" : "");
+    if (bw) printf("            bandwidth %u Hz requested\n", bw);
     printf("  applied   %lld Hz at %lld Hz%s\n",
            have_freq ? got_freq : -1, have_rate ? got_rate : -1,
            have_gain ? "" : "  (gain unread)");
+    if (have_bw) printf("  bandwidth %lld Hz applied\n", got_bw);
     if (have_gain) printf("  gain      %lld dB %s\n", got_gain, gain_auto ? "(auto)" : "(manual)");
+    /* The internal chain the chip settled on for this data rate: BBPLL, ADC, then each decimation
+     * stage. This is the difference between "it decimates on chip" as a belief and as a reading. */
+    print_attr_any(NULL, p.dev, "rx_path_rates", "RX path rates after");
     if (have_rate && got_rate > 0 && got_rate != (long long)rate)
         printf("  NOTE: the device changed the requested rate to %lld Hz\n", got_rate);
 
@@ -493,6 +507,8 @@ int main(int argc, char **argv)
     }
 
     printf("\ncapturing %ld samples...\n", want);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     if (iio_buffer_refill(buf) < 0) {
         fprintf(stderr, "iio_buffer_refill() failed\n");
         iio_buffer_destroy(buf); iio_context_destroy(ctx); return 1;
@@ -516,30 +532,48 @@ int main(int argc, char **argv)
         if (!out) { perror(outpath); }
     }
 
+    /* The decimation stage, if any. A box filter of N samples per output sample: cheap, and exactly
+     * the shape ogn-rf's own boxfilter.h uses. Statistics are taken on the DECIMATED stream, because
+     * that is what ogn-rf will actually see - reporting the chip-rate figures would flatter it. */
+    long long acc_i = 0, acc_q = 0;
+    int acc_n = 0;
+    long long n_out = 0;
     for (; pi < end && pq < end && n < want; pi += step, pq += step, n++) {
         int16_t vi, vq;
         memcpy(&vi, pi, sizeof(vi));
         memcpy(&vq, pq, sizeof(vq));
 
-        stats_add(&si, vi);
-        stats_add(&sq, vq);
-        if (vi < mn) mn = vi;
-        if (vq < mn) mn = vq;
-        if (vi > mx) mx = vi;
-        if (vq > mx) mx = vq;
+        acc_i += vi; acc_q += vq;
+        if (++acc_n < decim) continue;      /* still filling the box */
+
+        const double di = (double)acc_i / decim;
+        const double dq = (double)acc_q / decim;
+        acc_i = acc_q = 0; acc_n = 0;
+        n_out++;
+
+        stats_add(&si, di);
+        stats_add(&sq, dq);
+        if (di < mn) mn = di;
+        if (dq < mn) mn = dq;
+        if (di > mx) mx = di;
+        if (dq > mx) mx = dq;
 
         /* Clipping is judged against the significant bits, not the 16-bit container. */
-        if (fabs((double)vi) >= fullscale - 1 || fabs((double)vq) >= fullscale - 1) clipped++;
+        if (fabs(di) >= fullscale - 1 || fabs(dq) >= fullscale - 1) clipped++;
 
         if (out) {
-            uint8_t o[2] = { (uint8_t)((vi >> shift) + 128), (uint8_t)((vq >> shift) + 128) };
+            uint8_t o[2] = { (uint8_t)(((int)di >> shift) + 128), (uint8_t)(((int)dq >> shift) + 128) };
             if (fwrite(o, 1, 2, out) != 2) { /* stopped writing; keep capturing */ }
         }
     }
     if (out) {
         fclose(out);
-        printf("  wrote %lld I/Q pairs to %s (unsigned 8-bit, shift %d)\n", n, outpath, shift);
+        printf("  wrote %lld I/Q pairs to %s (unsigned 8-bit, shift %d)\n", n_out, outpath, shift);
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double wall = (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec);
+    const double achieved = wall > 0 ? (double)n / wall : 0.0;
 
     iio_channel_disable(p.i);
     iio_channel_disable(p.q);
@@ -548,7 +582,7 @@ int main(int argc, char **argv)
     /* ------------------------------------------------------------------------------------------ */
     /* report                                                                                     */
     /* ------------------------------------------------------------------------------------------ */
-    if (n == 0) {
+    if (n_out == 0) {
         printf("\nno samples were delivered\n");
         iio_context_destroy(ctx);
         return 1;
@@ -559,10 +593,20 @@ int main(int argc, char **argv)
     const double peak = (mn > -mx ? -mn : mx);            /* largest magnitude seen */
     const double rms = sqrt((rms_i * rms_i + rms_q * rms_q) / 2.0);
     const double crest = rms > 0 ? peak / rms : 0.0;
+    const double out_rate = (have_rate && got_rate > 0) ? (double)got_rate / decim : 0.0;
     const double dur = have_rate && got_rate > 0 ? (double)n / (double)got_rate : 0.0;
 
-    printf("\n%d samples (%.3f s at %lld Hz), %u-bit, full scale %.0f\n",
-           (int)n, dur, have_rate ? got_rate : 0LL, p.bits, fullscale);
+    if (decim > 1)
+        printf("\n%lld samples out after decimating by %d: %.0f Hz out, from %d chip-rate samples "
+               "(%.3f s at %lld Hz), %u-bit, full scale %.0f\n",
+               n_out, decim, out_rate, (int)n, dur, have_rate ? got_rate : 0LL, p.bits, fullscale);
+    else
+        printf("\n%d samples (%.3f s at %lld Hz), %u-bit, full scale %.0f\n",
+               (int)n, dur, have_rate ? got_rate : 0LL, p.bits, fullscale);
+    /* The achieved rate is what USB actually sustained - the number that says whether a given
+     * sampling_frequency is usable or merely accepted. */
+    printf("  throughput: %.3f Msps sustained over %.3f s of wall time (%.1f MB/s)\n",
+           achieved / 1e6, wall, achieved * 2.0 * (p.bits > 8 ? 2.0 : 1.0) / 1e6);
     printf("  I: mean %9.1f  rms %9.1f  min %8.0f  max %8.0f\n", mean_i, rms_i, si.mn, si.mx);
     printf("  Q: mean %9.1f  rms %9.1f  min %8.0f  max %8.0f\n", mean_q, rms_q, sq.mn, sq.mx);
     printf("  level: rms %.1f %%FS, peak %.1f %%FS, crest %.2f, clipped %lld samples\n",

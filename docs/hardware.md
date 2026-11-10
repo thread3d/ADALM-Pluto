@@ -81,6 +81,74 @@ Read it yourself with:
 ./scripts/probe-pluto.sh --capture -v      # prints rate available, gain available and the format
 ```
 
+### The decimation chain is on-chip already, and USB is the real ceiling
+
+The natural reading of "the Pluto samples fast and decimates internally, so run it fast and hand
+2 MSPS to ogn-rf" is that a higher sample rate buys something. Measured, it does not. Two facts
+settle it.
+
+**First: `sampling_frequency` is the post-decimation output rate, and the chip decimates on every
+setting.** `rx_path_rates` shows the internal chain it picks (BBPLL, ADC clock, HB3 `R2`, HB2 `R1`,
+the RX FIR, then the DMA rate), and the ADC clock simply rises with the requested data rate while
+the filter chain stays at ÷8:
+
+| Data rate out | ADC clock | R2 | R1 | RX FIR | Out | ADC ÷ out |
+|---|---|---|---|---|---|---|
+| 2 083 333 | 25.0 MHz | ÷3 → 8.33 M | ÷2 → 4.17 M | ÷2 → 2.08 M | 2 083 333 | **÷12** |
+| 4 000 000 | 32.0 MHz | ÷2 → 16 M | ÷2 → 8 M | ÷2 → 4 M | 3 999 999 | ÷8 |
+| 8 000 000 | 64.0 MHz | ÷2 → 32 M | ÷2 → 16 M | ÷2 → 8 M | 7 999 999 | ÷8 |
+| 15 360 000 | 122.88 MHz | ÷2 → 61.4 M | ÷2 → 30.7 M | ÷2 → 15.36 M | 15 359 999 | ÷8 |
+| 61 440 000 | 491.52 MHz | ÷2 → 245.8 M | ÷2 → 122.9 M | ÷2 → 61.44 M | 61 439 999 | ÷8 |
+
+So asking for a **higher** rate does not offload more work onto the chip; it raises the ADC clock,
+keeps the same ÷8 filtering, and multiplies what has to cross the USB cable. Only the minimum data
+rate gets the extra ÷12.
+
+**Second: the USB link saturates at about 8 MSPS.** Sustained rate actually achieved, 1 000 000
+samples per run:
+
+| Requested | Applied | Sustained | USB |
+|---|---|---|---|
+| 2 083 334 | 2 083 333 | **2.03 Msps** | 8.1 MB/s |
+| 4 000 000 | 3 999 999 | **3.85 Msps** | 15.4 MB/s |
+| 8 000 000 | 7 999 999 | **7.66 Msps** | 30.6 MB/s |
+| 15 360 000 | 15 359 999 | 7.67 Msps | 30.7 MB/s |
+| 30 720 000 | 30 719 999 | 8.02 Msps | 32.1 MB/s |
+| 61 440 000 | 61 439 999 | 7.94 Msps | 31.7 MB/s |
+
+The chip accepts 61.44 MSPS and the link delivers **8**. Everything above 8 MSPS is accepted and
+then silently dropped at ~31 MB/s, which is USB 2.0's real-world ceiling (480 Mbit/s theoretical,
+60 MB/s, halved by protocol overhead and two hubs). So "maximum sample rate" on this transport means
+**about 8 MSPS**, and running there would throw away three quarters of the samples.
+
+### What to actually configure for 2 MSPS into ogn-rf
+
+**2.000 MSPS cannot come out of the chip at all** — the floor is 2 083 333 Hz, 4 % above it. So a
+software step is unavoidable if ogn-rf is to run at exactly 2.0. The cost of each option:
+
+| Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
+|---|---|---|---|---|---|
+| 2 083 333 | **÷12** | none — but the rate is 2.0833, not 2.0 | 2 083 333 | 8 MB/s | needs ogn-rf at a non-round rate: `SpectrogramFFTsize` becomes 1066, not 1024 |
+| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | **recommended** — exact, cheap, 4× USB headroom |
+| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | at the USB ceiling for no gain |
+| 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | link delivers 8 MSPS, not 61 |
+
+4.0 MSPS ÷ 2 is the sweet spot for a reason that is not arbitrary: **8 × 2 000 000 / 15 625 = 1024
+exactly**, so ogn-rf's spectrogram is a power-of-two FFT as its author intended. At 2.0833 MSPS the
+same expression gives 1066, and at the RTL-SDR's 2.048 it gives 1048.
+
+**Measured, with the ÷2 stage implemented in `pluto_probe -D 2`:**
+
+```
+chip 3 999 999 Hz  ->  1 000 000 samples out at exactly 2 000 000 Hz
+  undecimated: rms 0.8 %FS, peak 4.1 %FS, crest 5.21, clipped 0
+  decimated:   rms 0.7 %FS, peak 3.3 %FS, crest 5.02, clipped 0
+```
+
+The averaged stream is ~1/√2 of the input as a box filter over independent noise should be, the
+crest factor holds, and nothing clips. The box filter is the same shape as ogn-rf's own
+`boxfilter.h`.
+
 ### Gain: measured, and the law is not a straight line
 
 The AD9363's receive gain is one `hardwaregain` attribute in manual mode. **Measured range: −1 to
