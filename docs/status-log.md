@@ -328,3 +328,70 @@ for, and it needs one `sudo` run.
 `./scripts/probe-pluto.sh --capture -v` — which prints, for the first time, the answers this whole
 design has been waiting on: `sampling_frequency_available` (the rate floor), `hardwaregain` and its
 range, and a real capture with crest factor and clipping counts.
+
+---
+
+## 2026-11-10 11:16 — it works, and everything below was measured
+
+The udev rule went in (`sudo scripts/install-pluto-udev.sh`), the radio was power-cycled, and
+**libiio opened it first time**:
+
+```
+$ ./pluto_probe --scan
+libiio 0.19 (git v0.19) sees 2 context(s):
+  local:                   Local devices
+  usb:1.32.5               0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=104473ae73930001fdff27009d682d6d06
+```
+
+`/dev/bus/usb/001/032` became `root:plugdev`, writable by `threaded`. That was the last blocker.
+Note the URI shape: **`usb:<bus>.<address>.<interface>`, where the address changes on every replug**
+(30, 31, 32 so far) and the IIO function is **interface 5**. So a fixed `usb:` URI is not a stable
+configuration value; the backend has to select the context by the device's serial number.
+
+### The measurements this project was waiting for
+
+| Question | Answer |
+|---|---|
+| Rate floor | `sampling_frequency_available = [2083333 1 61440000]`. 2083333 itself is **rejected** (the real divider gives 2 083 333.33); **2083334 works and applies 2 083 333**. 1.0 and 2.048 MSPS rejected |
+| 4.0 MSPS, the design default | applied **3 999 999 Hz** |
+| Firmware default at power-up | 30 719 999 Hz, 18 MHz bandwidth, `slow_attack` |
+| Gain range | `hardwaregain_available = [-1 1 73]` in manual mode — −1…73 dB, 1 dB steps |
+| Sample format | **12-bit signed, shift 0** on `cf-ad9361-lpc` voltage0/voltage1 → the 8-bit conversion is a shift of 4 and must be calibrated |
+| LO resolution | 868 400 000 requested → **868 399 998** applied (2 Hz low) |
+| Frequency correction | `xo_correction` = 39 999 890 Hz, range `[39991891 1 40007889]` — a **real** trim of ±200 ppm at 1 Hz (0.025 ppm) resolution |
+
+### Three corrections to earlier claims in this repository
+
+1. **There IS a hardware ppm control.** An earlier version of `docs/ogn-rf-integration.md` said the
+   AD9363 has "no ppm register" and that `FreqCorr` would have to be a software offset on the LO.
+   Wrong: `xo_correction` is a device attribute and does exactly this properly. `FreqCorr` maps onto
+   it as `xo = 40e6 + 40 × ppm` (1 ppm = 40 Hz at the 40 MHz XO).
+2. **`gain_control_mode` is a channel attribute**, on `voltage0` (input) of `ad9361-phy` — not a
+   device attribute. The device's 19 attributes do not include it. Writing it to the device fails
+   silently and leaves the radio in `slow_attack` while the tool reports a gain it never applied.
+3. **The crest factor figure imported from the RSPduo work does not transfer.** 4.2–5.2 here is a
+   textbook Gaussian maximum-over-rms for 300k samples, not evidence of compression.
+
+Two of those were bugs in this repository's own code, both found only because the radio finally
+worked and the numbers could be compared with what was expected. The probe now enumerates device
+*and* channel attributes in verbose mode for exactly this reason, and it had an inverted success
+check that printed "could not select manual gain" on success.
+
+### The radio receives real RF
+
+| Frequency | rms %FS | peak %FS | what it is |
+|---|---|---|---|
+| 100.000 MHz | **12.8** | 67.2 | FM broadcast |
+| 100.500 MHz | **13.6** | 65.0 | FM broadcast |
+| 433.920 MHz | **8.9** | 50.9 | ISM |
+| 868.400 MHz | **0.9** | 4.4 | the OGN channel |
+
+**+23 dB** of FM at 100 MHz over the OGN noise floor. The receive chain is verified end to end. The
+868 MHz band is quiet here, as it was for the RSPduo and the LimeSDR, so this says nothing yet about
+hearing aircraft — and nothing needs to be fixed about that.
+
+### What this unblocks
+
+The rate, the gain range, the format and the frequency trim are now measured rather than inferred,
+which is everything the `plutosdr.h` design was waiting on. The next piece of work is the backend
+itself, and the first thing it does when it runs is compare its own output with the numbers above.

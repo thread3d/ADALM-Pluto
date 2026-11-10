@@ -95,6 +95,21 @@ static int read_ll(struct iio_channel *ch, struct iio_device *dev, const char *n
     return 0;
 }
 
+/* Some attributes live on the channel and some on the device, and which is which varies with the
+ * driver and firmware. On this Pluto's firmware gain_control_mode is a CHANNEL attribute of
+ * voltage0 (input) with no device-level counterpart - so code that writes the device silently
+ * fails and manual gain is never selected. Try both, in that order. */
+static void print_attr_any(struct iio_channel *ch, struct iio_device *dev, const char *name, const char *label)
+{
+    char buf[256];
+    ssize_t n = ch ? iio_channel_attr_read(ch, name, buf, sizeof(buf)) : -1;
+    if (n <= 0 && dev) n = iio_device_attr_read(dev, name, buf, sizeof(buf));
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (char *q = buf; *q; q++) if (*q == '\n') *q = ' ';
+    printf("    %-34s = %s\n", label, buf);
+}
+
 static void print_attr(struct iio_channel *ch, struct iio_device *dev, const char *name, const char *label)
 {
     char buf[256];
@@ -201,6 +216,21 @@ static void describe_context(struct iio_context *ctx)
                    iio_channel_is_output(ch) ? "output" : "input",
                    iio_channel_is_scan_element(ch) ? "scan" : "",
                    fmt ? fmt->bits : 0, fmt ? fmt->shift : 0);
+            /* Channel attributes matter more than they look: on this firmware
+             * gain_control_mode and hardwaregain live HERE, not on the device. */
+            if (verbosity >= 2) {
+                unsigned int nca = iio_channel_get_attrs_count(ch);
+                for (unsigned int a = 0; a < nca; a++)
+                    printf("        .%s\n", iio_channel_get_attr(ch, a));
+            }
+        }
+        /* Device-level attributes. This is how you find out what an attribute is really called:
+         * guessing "gain_control_mode" and getting a silent failure costs an afternoon. */
+        unsigned int na = iio_device_get_attrs_count(d);
+        if (na) {
+            printf("      device attributes (%u):", na);
+            for (unsigned int a = 0; a < na; a++) printf(" %s", iio_device_get_attr(d, a));
+            printf("\n");
         }
     }
 }
@@ -259,6 +289,15 @@ static int find_phy(struct iio_context *ctx, struct phy *p)
     return 0;
 }
 
+/* Set the receive gain mode, whichever object the firmware put the attribute on. Returns 0 on
+ * success, -1 if both failed. */
+static int write_gain_mode(struct phy *p, const char *mode)
+{
+    if (p->rx0 && iio_channel_attr_write(p->rx0, "gain_control_mode", mode) >= 0) return 0;
+    if (p->dev && iio_device_attr_write(p->dev, "gain_control_mode", mode) >= 0) return 0;
+    return -1;
+}
+
 static void describe_phy(struct phy *p)
 {
     printf("  AD9363, as reported by the device:\n");
@@ -269,8 +308,10 @@ static void describe_phy(struct phy *p)
         print_attr(p->rx0, NULL, "hardwaregain_available",      "gain available");
         print_attr(p->rx0, NULL, "hardwaregain",                 "gain now");
     }
-    print_attr(NULL, p->dev, "gain_control_mode",   "gain mode");
-    print_attr(NULL, p->dev, "gain_control_mode_available", "gain modes available");
+    print_attr_any(p->rx0, p->dev, "gain_control_mode",           "gain mode");
+    print_attr_any(p->rx0, p->dev, "gain_control_mode_available", "gain modes available");
+    print_attr_any(NULL,   p->dev, "xo_correction",               "xo correction");
+    print_attr_any(NULL,   p->dev, "xo_correction_available",     "xo correction available");
     if (p->lo) print_attr(p->lo, NULL, "frequency",  "LO now");
     printf("  sample format: %u bits, shift %u, %s (this fixes the 8-bit conversion shift)\n",
            p->bits, p->shift, p->is_signed ? "signed" : "unsigned");
@@ -406,10 +447,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "  could not set the bandwidth to %u Hz\n", bw);
     }
     if (gain_auto) {
-        if (iio_device_attr_write(p.dev, "gain_control_mode", "slow_attack") < 0)
+        if (write_gain_mode(&p, "slow_attack") < 0)
             fprintf(stderr, "  could not select automatic gain\n");
     } else if (gain >= 0 && p.rx0) {
-        if (iio_device_attr_write(p.dev, "gain_control_mode", "manual") < 0)
+        if (write_gain_mode(&p, "manual") < 0)
             fprintf(stderr, "  could not select manual gain mode\n");
         if (iio_channel_attr_write_longlong(p.rx0, "hardwaregain", gain) < 0)
             fprintf(stderr, "  could not set gain to %lld dB\n", gain);

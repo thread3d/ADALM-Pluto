@@ -15,27 +15,33 @@ holds the scripts, measurements and documents, and one device branch in ogn-rf t
 
 ## Status
 
-Read this before anything else. **The radio is now stable on the bus, and one permissions gap stands
-between it and the first real measurement.**
+Read this before anything else. **The radio works.** It opens through libiio over USB, tunes, and
+captures 12-bit I/Q — verified by reading FM broadcast +23 dB above the noise floor it sees on the
+868.4 MHz OGN channel. The numbers the ogn-rf backend design was waiting on are now measured.
 
 | Item | State |
 |---|---|
 | Device identified | **confirmed, four times** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06` |
-| Current USB link | **stable since 11:12:41** — on **external power**. It had failed on all three bus-powered attempts, in three different ways. See [`docs/status-log.md`](docs/status-log.md) |
-| Device configured | **yes** — `bConfigurationValue = 1`; storage, network and serial functions all enumerated |
+| Current USB link | **stable** — on **external power**. It had failed on all three bus-powered attempts, in three different ways. See [`docs/status-log.md`](docs/status-log.md) |
+| Device configured | **yes** — `bConfigurationValue = 1` |
+| **libiio can open it** | **yes** — `usb:1.32.5`, `0456:b673`, serial `104473ae…`. Note the address changes on every replug: select by serial |
+| **Receive verified** | **yes** — 100 MHz FM reads 12.8 %FS against 0.9 %FS at 868.4 MHz (+23 dB), no clipping at any gain |
+| Rate floor (the key constraint) | **measured 2 083 333 Hz** — 1.0, 2.048 and even 2 083 333 are rejected; 2 083 334 is the number that works; 4 MSPS applies 3 999 999 |
+| Gain | **measured −1…73 dB**, 1 dB steps, and not linear in dB; 73 dB clips nothing here |
+| Frequency trim | **`xo_correction` exists** — ±200 ppm at 1 Hz resolution on a 40 MHz XO |
 | `libiio` runtime | **present** — 0.19-1 (Ubuntu 20.04), libusb backend compiled in |
 | `libiio` headers | **present** — `libiio-dev` 0.19-1, so a backend can be built here |
-| **udev rule for non-root USB access** | **the current blocker** — `/dev/bus/usb/001/031` is `root:root` `0664`, so libusb cannot open it and libiio sees no context. One `sudo` run of `scripts/install-pluto-udev.sh` |
+| udev rule for non-root USB access | **installed** — `scripts/install-pluto-udev.sh`; the node becomes `root:plugdev` and libusb can open it |
 | `iio-utils` (`iio_info`, `iio_attr`) | **missing** — not installed; the tools here do not need it |
 | Probe (device-level, independent of ogn-rf) | **exercised against a live radio** — which found and fixed a bug in it: it judged health by `/sys/bus/iio/devices`, always empty for a USB Pluto |
 | `adalm-pluto` branch of ogn-rf | **created and pushed** — `thread3d/ogn-rf@cbc2759`, design document only |
 | The backend itself (`plutosdr.h`) | **not started** — design only, in [`docs/ogn-rf-integration.md`](docs/ogn-rf-integration.md) |
-| `sampling_frequency_available`, gain range, conversion scale | **not yet read** — needs the udev rule first |
+| The 8-bit conversion shift | **not calibrated** — a shift of 4 is the arithmetic default, still to be measured |
 | Live OGN packet decoding | **not started** |
 
-The honest summary: the hardware now works, the tooling is verified against it, and the first
-measurements are one `sudo` away. Everything that says "measured" will say so only once it was
-measured.
+The honest summary: the hardware works, the tooling is verified against it, and the remaining work is
+the ogn-rf backend itself. Everything that says "measured" was measured; where something is still an
+assumption, it says so.
 
 ## Start here
 
@@ -78,9 +84,10 @@ hubs, could not feed the 500 mA the radio asks for. `scripts/watch-pluto.sh` exi
 failing device lived one to four seconds, which is far too short to inspect by hand; it sampled ten
 times a second and is what showed the transition from `UNCONFIGURED` to `CONFIGURED as value 1`.
 
-**One blocker remains**, and it is not the radio: `/dev/bus/usb/001/031` is `root:root` `0664`, so
-libusb cannot open it as `threaded` and libiio sees no context. That needs one `sudo` run of
-`scripts/install-pluto-udev.sh`.
+The last blocker was neither the radio nor the cable but permissions: the USB node is `root:root`
+`0664`, so libusb could not open it and libiio saw no context. One `sudo` run of
+`scripts/install-pluto-udev.sh` fixed that — the node becomes `root:plugdev`, and since `threaded` is
+already in `plugdev` it worked immediately.
 
 That same episode exposed a bug in this repository's own probe, now fixed: it judged health by
 `/sys/bus/iio/devices`, which for a USB Pluto is **always empty**, because IIO-over-USB is a

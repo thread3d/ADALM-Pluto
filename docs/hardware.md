@@ -1,8 +1,8 @@
 # Hardware, host and the USB layer
 
 What the radio is, what this board provides, and which of the Pluto's several USB faces you are
-looking at. Everything marked *observed* was read off this machine; everything marked *datasheet* is
-the vendor's claim and is still to be confirmed against the device's own attributes.
+looking at. Everything marked *observed* was read off this machine; everything marked *measured* was
+read back from the radio itself on 2026-11-10 and is no longer a datasheet claim.
 
 ## Host
 
@@ -30,7 +30,11 @@ port 4, and *observed* the Pluto enumerated at **`1-4.4.3`** — port 4, then hu
 | Product string | `PlutoSDR (ADALM-PLUTO)` *(observed)* |
 | Transceiver | AD9363 — 2 RX, 2 TX, full duplex, 12-bit ADC and DAC *(datasheet)* |
 | Tuning | 325 MHz to 3.8 GHz, stock *(datasheet)*; OGN lives at 868.2 / 868.4 MHz, comfortably inside |
-| Sample rate | max 61.44 MSPS *(datasheet)*; the floor is the number that matters — see below |
+| Sample rate | `sampling_frequency_available = [2083333 1 61440000]` *(measured)* — floor 2.083333 MSPS, ceiling 61.44 MSPS, step 1 Hz |
+| RX gain | `hardwaregain_available = [-1 1 73]` in manual mode *(measured)* — −1 to 73 dB, 1 dB steps |
+| Sample format | 12-bit signed, shift 0, on `cf-ad9361-lpc` voltage0/voltage1 *(measured)* |
+| Frequency control | `xo_correction` = 39 999 890 Hz, range `[39991891 1 40007889]` *(measured)* — a real ppm trim, ±200 ppm with 1 Hz (0.025 ppm) resolution |
+| IIO interface | interface 5 of the composite gadget *(measured)* |
 | Host link | USB 2.0 OTG, 480 Mbit/s |
 | Power | bus-powered from the USB port; no separate DC input |
 
@@ -54,22 +58,84 @@ legal rate and decimate in software to the rate ogn-rf asked for. `docs/ogn-rf-i
 through the choices; the short version is that **4.0 MSPS on chip, ÷2 in software, gives exactly
 2.0 MSPS** with clean integer arithmetic, and 8.0 ÷ 4 or 8.0 ÷ 8 give the same for more USB pressure.
 
-The exact floor is to be read from the device rather than trusted from a datasheet:
+**Measured on 2026-11-10, and the table above is now fact rather than inference:**
+
+| Requested | Result |
+|---|---|
+| 1 000 000 | **rejected** |
+| 2 000 000 | **rejected** |
+| 2 083 333 | **rejected** — this is the trap: it is the advertised minimum, but the real divider gives 2 083 333.33 Hz, so asking for the truncated value fails |
+| 2 083 334 | accepted, applied **2 083 333 Hz** ← the true floor, and the number to ask for |
+| 2 400 000 | applied 2 400 000 Hz |
+| 4 000 000 | applied 3 999 999 Hz |
+| 30 720 000 | the firmware's own default at power-up |
+
+So `sampling_frequency_available` reporting a minimum of 2083333 is slightly misleading: the value
+that works is **2083334**, and everything below it is genuinely impossible. This is why the
+decimation design is not a preference — 2.0 MSPS, ogn-rf's default 1.0 MSPS and the RTL-SDR's
+2.048 MSPS are all unreachable on this chip.
+
+Read it yourself with:
 
 ```bash
-iio_attr -u usb:1.4.4.3 -c ad9361-phy -o voltage0 sampling_frequency_available
+./scripts/probe-pluto.sh --capture -v      # prints rate available, gain available and the format
 ```
 
-(`iio_attr` is not installed on this board yet — see below.)
+### Gain: measured, and the law is not a straight line
 
-### Gain is a measured quantity here, not a documented one
+The AD9363's receive gain is one `hardwaregain` attribute in manual mode. **Measured range: −1 to
+73 dB in 1 dB steps** (`hardwaregain_available = [-1 1 73]`). One trap: the range reported depends
+on the gain mode — read in `slow_attack` it reported `[-3 1 71]`, so read it *after* selecting
+`manual` or the numbers move under you.
 
-The AD9363's receive gain is a single `hardwaregain` attribute in manual mode, with an
-implementation-defined range and step. The earlier radios each needed their gain law measured before
-the numbers meant anything — the RSPduo's turned out to be `total = 115.8 − gRdB` — and this one will
-need the same treatment: sweep `hardwaregain`, measure RMS and crest factor, and write the law down.
-**No gain figure in this repository is measured yet**, and `config/ogn-rf-pluto.conf` says so at the
-point of use rather than pretending to a default.
+Where the attribute lives is the other trap. On this firmware **`gain_control_mode` is a channel
+attribute of `voltage0` (input) on `ad9361-phy`, not a device attribute.** The device exposes 19
+attributes and gain mode is not among them, so code that writes it to the device fails silently and
+the radio stays in `slow_attack` while reporting a gain it never applied. (This cost an afternoon.
+The probe now tries the channel first and falls back to the device.)
+
+Swept at 868.400 MHz, 4 MSPS, 300 000 samples, 12-bit full scale 2048:
+
+| `hardwaregain` | rms %FS | peak %FS | crest | clipped |
+|---|---|---|---|---|
+| 0 | 0.2 | 0.7 | 4.20 | 0 |
+| 10 | 0.1 | 0.6 | 4.24 | 0 |
+| 20 | 0.1 | 0.7 | 4.96 | 0 |
+| 30 | 0.1 | 0.7 | 5.15 | 0 |
+| 40 | 0.1 | 0.7 | 4.97 | 0 |
+| 50 | 0.2 | 0.9 | 4.64 | 0 |
+| 60 | 0.3 | 1.3 | 4.58 | 0 |
+| 70 | 0.6 | 3.1 | 4.79 | 0 |
+| 73 | 0.9 | 4.2 | 4.75 | 0 |
+
+Two things to read carefully in that table:
+
+1. **The law is not 1 dB per dB.** Level barely moves between 0 and 50 dB and then grows from 50 to
+   73. The AD9361's gain is staged (LNA, mixer, TIA, digital), so the total is not linear in the
+   single number the driver exposes. Anyone expecting `total = a − gRdB` as on the RSPduo will not
+   find it here; the table *is* the law.
+2. **Nothing clips, even at maximum.** At 73 dB the noise floor is 0.9 %FS. That is a quiet 868 MHz
+   and no LNA in the chain — the same conclusion the LimeSDR and RSPduo work reached on this site.
+
+A crest factor of 4.2–5.2 through that sweep is **normal, not compression**: it is the maximum of a
+Gaussian sample divided by its rms over 300k samples, which sits near 4.5. The RSPduo repository's
+"9–11 is healthy, 3–5 is folding" figure came from a different measurement and does not transfer.
+
+### Real RF, verified
+
+The radio is not merely delivering noise. At maximum gain, 4 MSPS, 300 000 samples:
+
+| Frequency | What is there | rms %FS | peak %FS |
+|---|---|---|---|
+| 100.000 MHz | FM broadcast | **12.8** | 67.2 |
+| 100.500 MHz | FM broadcast | **13.6** | 65.0 |
+| 433.920 MHz | ISM band | **8.9** | 50.9 |
+| 868.400 MHz | the OGN channel | **0.9** | 4.4 |
+
+That is **+23 dB** of real signal at 100 MHz over the OGN noise floor, which settles the question of
+whether the RF path works. What it does not settle is hearing an aircraft: 868.4 MHz measures as
+quiet, exactly as it did for the RSPduo and the LimeSDR on this site. A receiver that works and a
+sky that is empty look identical from here.
 
 ## The Pluto's several USB faces
 
@@ -131,7 +197,7 @@ A Pluto bring-up is complete when, on this board:
 2. `probe-pluto.sh --capture` produces a spectrum with a real noise floor and no clipping;
 3. `ogn-rf` starts, reports the Pluto as its radio, and its status page shows 868.x MHz at the
    configured rate;
-4. the gain law is measured, not guessed.
+4. the gain is set from the measured table above, not guessed.
 
 Note what is *not* on that list: decoding live OGN packets. On this site both OGN channels measured
 as noise floor with the RSPduo and the LimeSDR as well, so a quiet sky is the normal result here and

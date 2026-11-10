@@ -121,9 +121,9 @@ so the backend has to answer all of them or the branch does not link.
 | `int ResetBuffer()` | discard what is already queued: refill and drop, until the buffer is empty |
 | `int setCenterFreq(uint32_t)` / `getCenterFreq()` | write/read `altvoltage0` → `frequency` on `ad9361-phy` |
 | `int setSampleRate(uint32_t)` / `getSampleRate()` | write/read `voltage0` → `sampling_frequency` |
-| `int setFreqCorrection(int PPM)` / `getFreqCorrection()` | no ppm register: apply as an offset on the LO, which is what a ppm figure is |
+| `int setFreqCorrection(int PPM)` / `getFreqCorrection()` | device attribute `xo_correction` — a **real** ppm trim, measured ±200 ppm at 1 Hz resolution on a 40 MHz XO, so `xo = 40e6 + 40 x ppm` |
 | `int setTunerGain(int)` / `getTunerGain()` / `getTunerGains()` | `voltage0` → `hardwaregain`, with `gain_control_mode` = `manual` |
-| `int setTunerGainMode(int Manual)` | device attribute `gain_control_mode` (`manual` / `slow_attack` / `fast_attack`) |
+| `int setTunerGainMode(int Manual)` | `gain_control_mode` — **a channel attribute of `voltage0` (input)**, not a device attribute; values `manual fast_attack slow_attack hybrid`. Writing it to the device fails silently |
 | `int setOffsetTuning(int)` | accepted and ignored, like the RSPduo: there is no offset-tuning trick here |
 | `int setBiasTee(int)` | **not available.** The Pluto has no bias tee; the call is accepted and ignored, and says so once |
 | `void setOversample(int Ratio)` | sets the chip rate to `Ratio ×` the requested rate — the core of the rate design below |
@@ -185,30 +185,46 @@ Two new keys, both following the existing `RF.*` conventions:
 `config/ogn-rf-pluto.conf` in this repository is the reference configuration; it marks every value
 that is not yet measured as such.
 
-## Open questions to settle on hardware
+## What hardware has now answered
 
-Ordered by how much they change the design:
+Five questions were open when this document was written. Four are answered, and the answers moved the
+design rather than confirming it casually.
 
-1. **The real rate floor.** `sampling_frequency_available` on `voltage0` — if it permits 2.0 MSPS
-   directly, the whole decimation design collapses into a pass-through and the work gets simpler.
-2. **The gain law.** Sweep `hardwaregain`, measure RMS and crest factor, write the law down the way
-   the RSPduo repository did (`total = 115.8 − gRdB`). Until then no gain figure is meaningful.
-3. **Which USB face the firmware offers,** and whether USB or the network gadget is the better
-   transport for a 1-second burst every 30 seconds. USB avoids depending on a DHCP lease.
-4. **`ResetBuffer()` semantics.** The RSPDuo backend needed a real ring-buffer bridge because the API
-   is callback-driven. libiio is blocking-read, which is closer to the RTL-SDR model, but how much
-   stale data a refill can hand over after a retune is exactly the kind of thing that produces a
-   half-time-slot warning if it is wrong.
-5. **Whether the 2.083 MSPS chip minimum and ogn-rf's 15 625 Hz-bin assumptions agree** — the
-   spectrogram size is computed as `(8*SampleRate)/15625`, which is not a power of two at any of
-   these rates, and has not been exercised.
+| Question | Answer | Consequence |
+|---|---|---|
+| **The rate floor** | `sampling_frequency_available = [2083333 1 61440000]`; 2083333 itself is rejected, **2083334 works and applies 2 083 333**; 1.0 and 2.048 MSPS rejected; 4.0 MSPS applies 3 999 999 | **decimation is required, not preferred** — `setOversample(2)` at a 4 MSPS chip rate giving 2.0 MSPS is right |
+| **The gain law** | range `[-1 1 73]`, 1 dB steps; the law is **not** 1 dB per dB (staged LNA/mixer/TIA/digital); nothing clips at 73 dB, where the floor is 0.9 %FS | use the measured table in `docs/hardware.md`; `Gain = 73` in the shipped config |
+| **Sample format** | 12-bit signed, shift 0 | the 8-bit conversion is a shift of 4, still to be calibrated against a known level |
+| **Which USB face** | interface 5 carries IIO; a `usb:` context opens reliably. The network gadget is **not** up: `rndis_host` and `cdc_acm` are modules that are not loaded, so no `usb0`, no `ttyACM` | USB is the transport; `ip:192.168.2.1` would need those modules first |
+| **Attribute locations** | `gain_control_mode` and `hardwaregain` are **channel** attributes of `voltage0` (input); `xo_correction` and `ensm_mode` are device attributes | this one cost an afternoon of a backend setting a gain the radio never applied |
 
-## Why nothing is committed yet
+Hardware also taught something no document would have: **the libiio USB URI is not stable.** It is
+`usb:<bus>.<address>.<interface>`, and the address changed on every replug (30, 31, 32) during the
+bring-up. The backend must select the context **by serial number**, not a pinned URI — which is why
+`config/ogn-rf-pluto.conf` now carries `DeviceSerial` and comments out `DeviceUri`.
 
-Each of the five questions above changes code. Writing the backend first would mean guessing at the
-answers and then discovering which guesses were wrong from a receiver that half-works — the failure
-mode the other device branches spent their time chasing. The branch is created and holds this design;
-`plutosdr.h` starts the day the radio stays on the bus.
+## What is still open
+
+These need the backend to exist before they can be answered:
+
+1. **`ResetBuffer()` semantics.** libiio is a blocking read, closer to the RTL-SDR model than the
+   RSPduo's callback API, but how much stale data a refill can hand over after a retune is exactly
+   what produces a "Half time slot" warning when it is wrong.
+2. **The conversion shift.** The format says 12 bits, shift 0; the right 8-bit scale is still a
+   calibration against a known level, the way the RSPduo work settled on a shift of 8.
+3. **ogn-rf's rate assumptions at a decimated 2.0 MSPS.** The spectrogram size is
+   `(8*SampleRate)/15625`, which is not a power of two at these rates and has never been exercised.
+   This is the item most likely to need a change in ogn-rf itself rather than in the backend.
+4. **Sustained USB throughput.** A 0.5 s capture at 4 MSPS is 16 MB and works. Whether a
+   one-second-every-thirty-seconds duty cycle is comfortable over 480 Mbit/s behind two hubs is a
+   different question, and it is what `SensTime` will exercise.
+
+## Why the branch still holds only this document
+
+Not for want of hardware any more — the radio works and its numbers are measured. It holds it because
+the next commit should be `plutosdr.h`, written against those measurements in one pass, rather than
+another draft produced while the answers were still moving. This document has already been rewritten
+three times for that reason; a fourth draft of prose is worth less than one first draft of code.
 
 To read the branch itself:
 
