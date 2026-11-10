@@ -109,3 +109,18 @@ On this board:
 cd ~/projects/ADALM-Pluto/ogn-rf
 git checkout adalm-pluto
 ```
+
+## Working on this from two machines
+
+The repository is published at [`thread3d/ADALM-Pluto`](https://github.com/thread3d/ADALM-Pluto) and
+also lives on the board at `~/projects/ADALM-Pluto/adalm-pluto`. Pushes are made from the machine
+that has `gh` authenticated for `thread3d`; the board has no `gh` and no deploy key, so it can
+**pull** (the repository is public) but cannot push.
+
+```bash
+# on the board, to pick up a change pushed elsewhere
+cd ~/projects/ADALM-Pluto/adalm-pluto && git pull --ff-only
+```
+
+If that ever needs to change, a deploy key on the board is the way — but it should be a decision
+someone makes deliberately, not something a script leaves behind.
