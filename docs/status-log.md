@@ -114,3 +114,86 @@ One more finding from the same session, because it will bite later: this board h
 from source by the KrakenSDR work at `~/projects/KrakenSDR/krakensdr/deps/prefix`. `libiio` 0.19, by
 contrast, *is* a system library. `docs/ogn-rf-integration.md` records the build line that follows
 from that.
+
+---
+
+## 2026-11-10 11:02 — the radio comes back, and fails earlier
+
+Re-plugged by hand at 11:02:31 while the repository was being written. It enumerated again, on the
+**same port**, and this time it did not even get as far as configuring:
+
+```
+Nov 10 11:02:31 xavieragx kernel: usb 1-4.4.3: new high-speed USB device number 22 using tegra-xusb
+Nov 10 11:02:32 xavieragx kernel: usb 1-4.4.3: New USB device found, idVendor=0456, idProduct=b673, bcdDevice= 6.01
+Nov 10 11:02:32 xavieragx kernel: usb 1-4.4.3: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+Nov 10 11:02:32 xavieragx kernel: usb 1-4.4.3: can't set config #1, error -71
+```
+
+`-71` is `EPROTO`, a protocol error on the control transfer. The device is on the bus and
+unconfigured: `/sys/bus/usb/devices/1-4.4.3/bConfigurationValue` is **empty**, no interface bound, no
+IIO device, no storage volume, no `ttyACM`, and — unlike the 10:44 attempt — the sysfs entries for
+`product`, `manufacturer` and `serial` are **absent**, so the string descriptors never came back
+either.
+
+### This revises the earlier entry
+
+The first entry called a brown-out on a bus-powered hub "the leading suspect". Reading the
+configuration descriptors says that story does not hold as written:
+
+| Device / hub | Port | Config `bmAttributes` | Declares |
+|---|---|---|---|
+| `USB2.1 Hub` (0bda:5411) | `1-4` | `0xE0` | **self-powered** |
+| `USB2.1 Hub` (0bda:5411) | `1-4.4` | `0xE0` | **self-powered** |
+| `Microchip Hub` (0424:2517) | `1-4.3` | `0xE0` | **self-powered** |
+| `LimeSDR-USB` | `1-4.4.1` | `0x80` | bus-powered, 100 mA |
+| `RSPduo` | `1-4.4.2` | `0x80` | bus-powered, 400 mA |
+| **`PlutoSDR`** | `1-4.4.3` | `0x80` | bus-powered, **500 mA** |
+
+Both hub levels above the Pluto declare themselves self-powered with `bMaxPower` 0, so they claim not
+to be drawing their budget from the host — which means the port should be able to give the Pluto the
+500 mA it asks for, and a shared-current story at the hub is **not supported by the descriptors**.
+
+Worth keeping in mind, honestly: cheap hubs are known to set the self-powered bit while actually
+running off upstream VBUS, and nothing here can measure the port. So this is "the descriptors do not
+support the hypothesis", not "power is ruled out".
+
+### What the two failures have in common
+
+| | 10:44:55 | 11:02:32 |
+|---|---|---|
+| Enumerated at high speed | yes | yes |
+| String descriptors read | **yes** (product, manufacturer, serial) | **no** (absent from sysfs) |
+| Reached SET_CONFIGURATION | **yes** — `usb-storage` bound interface 2 | **no** — `EPROTO` |
+| Survived | 4 s, then reset and dropped | never configured |
+
+Two different failure points on the same port, both intermittent, with the device getting *worse* on
+the second attempt. That pattern — intermittency plus an early protocol error plus progressively
+degraded enumeration — is what a **marginal physical connection** looks like: a cable, a connector, or
+a solder joint that makes contact differently each time it is plugged in.
+
+### Recommended order of tests, cheapest first
+
+1. **A different cable.** Now the leading suspect rather than the fallback. It has to be a real data
+   cable, short, and known good.
+2. **A different port — and there is a good one free.** The USB3.2 hubs on bus 002 (`2-4` and
+   `2-4.4`) are self-powered and have **all four ports each unused**. A USB 2.0 device works normally
+   in a USB 3.x hub port. This also takes the Pluto off the hub it shares with the RSPduo and the
+   LimeSDR.
+3. **Power-cycle the Pluto properly.** Its only power source is that USB port, so unplugging it is
+   the power cycle; give it at least 15 s for the bulk capacitance to drain before replugging.
+4. **If it configures and then drops at ~4 s again**, the remaining suspect is the Pluto's own 5 V to
+   core supply — a board fault, not a host one.
+
+None of these need root, and `probe-pluto.sh` reports the result of each in one line:
+
+```bash
+./scripts/probe-pluto.sh --brief     # OK / FAIL
+./scripts/probe-pluto.sh             # and, when FAIL, which of the modes it is
+```
+
+### What is still blocked
+
+Everything in `docs/ogn-rf-integration.md`'s "Open questions" list, for the same reason as before:
+`sampling_frequency_available`, the gain range and the conversion scale all live on the device, and
+the device has to survive configuration before any of them can be read. The tooling to read them the
+moment it does — `probe-pluto.sh --capture` — is written, compiled and waiting.

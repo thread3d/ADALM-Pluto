@@ -20,8 +20,8 @@ verified against live hardware.**
 
 | Item | State |
 |---|---|
-| Device identified | **seen once** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06` |
-| Current USB link | **failing** — enumerates, then disappears ~4 s later. See [`docs/status-log.md`](docs/status-log.md) |
+| Device identified | **confirmed** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06`, seen at 10:44:55 and again at 11:02:32 |
+| Current USB link | **failing, in two ways** — once configured then dropped after 4 s; once `can't set config #1, error -71`. See [`docs/status-log.md`](docs/status-log.md) |
 | `libiio` runtime | **present** — 0.19-1 (Ubuntu 20.04), libusb backend compiled in |
 | `libiio` headers | **present** — `libiio-dev` 0.19-1, so a backend can be built here |
 | `iio-utils` (`iio_info`, `iio_attr`) | **missing** — not installed; `probe-pluto.sh` works without it |
@@ -54,12 +54,17 @@ the failure modes in `docs/hardware.md` you are looking at.
 
 ## The USB problem, in one paragraph
 
-The Pluto was plugged in on 2026-11-10 at 10:44:55 and identified correctly, then fell off the bus at
-10:44:59 with `Power-on or device reset occurred` from the SCSI layer. It has not re-appeared. The
-port it was on (`1-4.4.3`) is three hubs deep on a 480 Mbit/s bus, and the Pluto is bus-powered, so
-the leading suspect is a brown-out rather than a driver problem; the fix being tested first is a
-direct port or a powered hub. `docs/status-log.md` has the exact kernel lines and what each
-candidate cause would look like.
+The Pluto has been seen twice, and failed differently each time — which is the useful part. At
+10:44:55 it identified itself fully, configured, presented its firmware volume, then reported
+`Power-on or device reset occurred` and dropped off the bus four seconds later. On a re-plug at
+11:02:32 it enumerated and then could not configure at all: `can't set config #1, error -71`
+(`EPROTO`), with no string descriptors readable and `bConfigurationValue` left empty. Two failure
+points, both intermittent, the second worse than the first. That is the signature of a marginal
+physical connection, so the cable is now the first thing to change — not the last. The
+brown-out-on-a-bus-powered-hub theory that this file used to lead with does not survive the
+descriptors: every hub above the Pluto declares itself **self-powered**. `docs/status-log.md` has the
+kernel lines, the descriptor table and an ordered, cheap-first list of what to try. It also notes the
+one genuinely good port choice: the two USB3.2 hubs on bus 002 are self-powered and completely unused.
 
 ## Why this radio is different
 
