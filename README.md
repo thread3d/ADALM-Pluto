@@ -30,6 +30,8 @@ captures 12-bit I/Q — verified by reading FM broadcast +23 dB above the noise 
 | Bandwidth | **4 MHz** — measured ~5 dB stronger than 56 MHz at 2 MSPS |
 | **S/N** | **gain is the only knob that matters**, and it saturates near 65 dB (last 18 dB buys 2.25 dB). Port, bandwidth and sample rate are all flat within 1.5 dB |
 | Spectrum tool | `pluto_probe -S` — Welch, 8192 bins, self-checking against the sample power to 0.04 dB |
+| Band monitor | `pluto_probe -M SECONDS` — max-hold spectrum, for bursty ISM traffic (sensors, remotes) |
+| Real rate range | **0.52–30.72 MSPS** once an RX FIR is loaded (`sampling_frequency_available` becomes `[520833 1 30720000]`) |
 | **AGC** | **exists** — `manual`, `fast_attack`, `slow_attack`, `hybrid`, plus ~40 tuning attributes. **Not used**: on the quiet band it parks ~10 dB below max and hunts ±2 dB continuously. See `docs/hardware.md` |
 | The FFT this buys | `Inp_FFT` uses `(8*8*SampleRate)/15625` → **8192 = 2¹³** at 2.000 MSPS vs 8533 = 7·23·53 at 2.0833 |
 | Gain | **measured −1…73 dB**, 1 dB steps, and not linear in dB; 73 dB clips nothing here |

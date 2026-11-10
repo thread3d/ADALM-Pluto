@@ -418,8 +418,15 @@ static void report_spectrum(const float *i, const float *q, size_t n,
             in[k][1] = (float)(xq * win[k]);
         }
         fftwf_execute(plan);
-        for (int k = 0; k < fft_size; k++)
-            acc[k] += (double)out[k][0] * out[k][0] + (double)out[k][1] * out[k][1];
+        /* FFTW returns NATURAL order (bin 0 = DC). Every consumer below assumes fftshift order
+         * (bin i <-> centre + (i - N/2) * bin_hz, DC at N/2), so shift on the way in. Getting this
+         * wrong moves every reported frequency by half the sample rate - which is exactly what an
+         * earlier version of this code did, and it put the interferers 1 MHz away from where they
+         * really were. */
+        for (int k = 0; k < fft_size; k++) {
+            const int i = (k + fft_size / 2) % fft_size;
+            acc[i] += (double)out[k][0] * out[k][0] + (double)out[k][1] * out[k][1];
+        }
         used++;
     }
     fftwf_destroy_plan(plan);
@@ -488,6 +495,167 @@ static void report_spectrum(const float *i, const float *q, size_t n,
 #endif /* USE_FFTW */
 
 /* ---------------------------------------------------------------------------------------------- */
+/* band monitor: what is actually in this band, and how loud does it get?                          */
+/* ---------------------------------------------------------------------------------------------- */
+
+#ifdef USE_FFTW
+/* Runs for a while, FFTs every block, and keeps a MAX HOLD per bin alongside an average.
+ *
+ * Max-hold is the right instrument here: garage door openers, weather sensors and smart meters
+ * transmit in short bursts with a low duty cycle, so an averaged spectrum hides them and a single
+ * capture usually misses them. The max hold remembers the strongest thing that happened in each bin
+ * for the whole run, which is what decides whether a fixed gain will clip.
+ */
+static int run_monitor(struct iio_buffer *buf, struct iio_channel *ci, struct iio_channel *cq,
+                       int fft_size, int secs, double rate, uint32_t center, double fullscale)
+{
+    float         *hold   = NULL;   /* per-bin max power */
+    double        *avg    = NULL;   /* per-bin running mean power */
+    double        *win    = NULL;
+    fftwf_complex *in     = NULL, *out = NULL;
+    fftwf_plan     plan   = NULL;
+    int            ok     = 0;
+
+    hold = malloc(sizeof(float) * fft_size);
+    avg  = calloc(fft_size, sizeof(double));
+    win  = malloc(sizeof(double) * fft_size);
+    in   = fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+    out  = fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+    if (!hold || !avg || !win || !in || !out) { printf("monitor: out of memory\n"); goto done; }
+
+    double winsum2 = 0.0;
+    for (int k = 0; k < fft_size; k++) {
+        win[k] = 0.5 - 0.5 * cos(2.0 * M_PI * k / (fft_size - 1));
+        winsum2 += win[k] * win[k];
+    }
+    for (int k = 0; k < fft_size; k++) hold[k] = 0.0f;
+
+    plan = fftwf_plan_dft_1d(fft_size, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+    if (!plan) { printf("monitor: no plan\n"); goto done; }
+
+    const double bin_hz = rate / fft_size;
+    const int    dc     = fft_size / 2;
+    double  norm = 1.0 / (winsum2 * (double)fft_size);
+
+    const ptrdiff_t step = iio_buffer_step(buf);
+    long long  blocks = 0, samples = 0;
+    double     peak_time = 0.0;      /* strongest single sample, in full-scale units */
+    double     sum_block_peak = 0.0;
+    int        burst_blocks = 0;
+    double     median_block_peak = 0.0;   /* filled in from a sample of block peaks */
+    double     peaks[512]; int npeaks = 0;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    printf("\nmonitoring %u Hz for %d s, %.0f Hz bins, max-hold spectrum...\n", center, secs, bin_hz);
+    fflush(stdout);
+
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double elapsed = (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec);
+        if (elapsed >= secs) break;
+        if (iio_buffer_refill(buf) < 0) break;
+
+        char *pi = iio_buffer_first(buf, ci);
+        char *pq = iio_buffer_first(buf, cq);
+        char *end = iio_buffer_end(buf);
+        const long long n_avail = (end - pi) / step;
+        double blk_peak = 0.0;
+
+        /* Time-domain peak over EVERY sample in the block: this is the number that decides clipping,
+         * so it must never be sub-sampled. */
+        for (long long n2 = 0; n2 < n_avail; n2++) {
+            int16_t vi, vq;
+            memcpy(&vi, pi + n2 * step, sizeof(vi));
+            memcpy(&vq, pq + n2 * step, sizeof(vq));
+            const double m = fmax(fabs((double)vi), fabs((double)vq)) / fullscale;
+            if (m > blk_peak) blk_peak = m;
+        }
+        if (blk_peak > peak_time) peak_time = blk_peak;
+        samples += n_avail;
+
+        /* FFT every complete chunk, not just the first one. An earlier version transformed only the
+         * first 8192 samples of a 262144-sample block, so the max-hold spectrum watched 3% of the
+         * time and a bursty transmitter had to be lucky to be seen at all. */
+        for (long long off = 0; off + fft_size <= n_avail; off += fft_size) {
+            for (int k = 0; k < fft_size; k++) {
+                int16_t vi, vq;
+                memcpy(&vi, pi + (off + k) * step, sizeof(vi));
+                memcpy(&vq, pq + (off + k) * step, sizeof(vq));
+                in[k][0] = (float)(vi / fullscale * win[k]);
+                in[k][1] = (float)(vq / fullscale * win[k]);
+            }
+            fftwf_execute(plan);
+            for (int k = 0; k < fft_size; k++) {
+                const int i = (k + fft_size / 2) % fft_size;   /* natural -> fftshift order */
+                const float p = (float)(((double)out[k][0] * out[k][0] +
+                                         (double)out[k][1] * out[k][1]) * norm);
+                if (p > hold[i]) hold[i] = p;
+                avg[i] += p;
+            }
+            blocks++;
+        }
+        sum_block_peak += blk_peak;
+        if (npeaks < 512) peaks[npeaks++] = blk_peak;
+
+        if (blocks % 500 == 0 && blocks) {
+            printf("  %3.0f s  blocks=%lld  peak so far %.1f %%FS\n",
+                   elapsed, blocks, 100.0 * peak_time);
+            fflush(stdout);
+        }
+    }
+
+    if (blocks == 0) { printf("monitor: no complete blocks\n"); goto done; }
+
+    /* median block peak, to spot bursts that stand well above the typical block */
+    qsort(peaks, npeaks, sizeof(double), cmp_double);
+    median_block_peak = npeaks ? peaks[npeaks / 2] : 0.0;
+    for (int i = 0; i < npeaks; i++) if (peaks[i] > 4.0 * median_block_peak) burst_blocks++;
+
+    /* noise floor from the average spectrum */
+    double *srt = malloc(sizeof(double) * fft_size);
+    memcpy(srt, avg, sizeof(double) * fft_size);
+    qsort(srt, fft_size, sizeof(double), cmp_double);
+    const double med_avg = srt[fft_size / 2] / (double)blocks;   /* per bin, averaged over blocks */
+    free(srt);
+
+    printf("\n=== %d s, %lld blocks, %lld samples (%.1f %%FS single-sample max) ===\n",
+           secs, blocks, samples, 100.0 * peak_time);
+    printf("  typical block peak : %6.1f %%FS     (median over %d blocks)\n", 100.0 * median_block_peak, npeaks);
+    printf("  blocks > 4x typical: %6d           (%s)\n", burst_blocks,
+           burst_blocks ? "bursts present" : "nothing burst-like seen");
+    printf("  averaged noise floor: %7.2f dBFS/bin\n",
+           10.0 * log10(med_avg > 0 ? med_avg : 1e-30));
+
+    /* top bins by max hold - the strongest thing each frequency ever did */
+    printf("\n  strongest bins ever seen (max hold), DC excluded:\n");
+    printf("    %10s  %10s  %10s  %8s\n", "MHz", "max dBFS", "avg dBFS", "over floor");
+    for (int n = 0; n < 12; n++) {
+        int best = -1;
+        for (int k = 0; k < fft_size; k++) {
+            if (k >= dc - 4 && k <= dc + 4) continue;      /* skip the DC skirt */
+            if (best < 0 || hold[k] > hold[best]) best = k;
+        }
+        if (best < 0) break;
+        const double mx = 10.0 * log10(hold[best] > 0 ? hold[best] : 1e-30);
+        const double av = 10.0 * log10((avg[best] / blocks) > 0 ? (avg[best] / blocks) : 1e-30);
+        /* av is now directly comparable with the averaged floor printed above */
+        printf("    %10.4f  %10.2f  %10.2f  %8.2f\n",
+               1e-6 * (center + (best - dc) * bin_hz), mx, av,
+               mx - (10.0 * log10(med_avg > 0 ? med_avg : 1e-30)));
+        hold[best] = -1.0f;   /* retire it so the next pass finds the next strongest */
+    }
+    ok = 1;
+
+done:
+    if (plan) fftwf_destroy_plan(plan);
+    fftwf_free(in); fftwf_free(out);
+    free(hold); free(avg); free(win);
+    return ok ? 0 : 1;
+}
+#endif /* USE_FFTW */
+
+/* ---------------------------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
@@ -508,6 +676,7 @@ int main(int argc, char **argv)
     int segs = 32;              /* -G: Welch segments to average */
     const char *rx_port = NULL; /* -P: rf_port_select, e.g. A_BALANCED or A_N */
     const char *gain_mode_name = "slow_attack"; /* which AGC mode -g auto/fast/hybrid selects */
+    int monitor_secs = 0;       /* -M: monitor the band for this many seconds */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-u")) uri = opt(argc, argv, &i);
@@ -529,12 +698,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-D")) decim = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-B")) bb_rate = strtoll(opt(argc, argv, &i), NULL, 0);
         else if (!strcmp(argv[i], "-S")) spec_mode = 1;
+        else if (!strcmp(argv[i], "-M")) monitor_secs = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-F")) fft_size = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-G")) segs = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-P")) rx_port = opt(argc, argv, &i);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [-u URI] [-f HZ] [-r HZ] [-g DB|auto] [-n N] [-o FILE] [-s SHIFT] [-b HZ] [-D N] [-v]\n", argv[0]);
             printf("       -D N   decimate by N in software after the chip, e.g. -r 4000000 -D 2 = 2.0 MSPS out\n");
+            printf("       -M SEC monitor the band for SEC seconds with a max-hold spectrum,\n");
+            printf("              to find bursty traffic (sensors, remotes) and the headroom it needs\n");
             printf("       -S     report a Welch spectrum: noise floor, peak, CNR and density\n");
             printf("       -F N   FFT length for -S, default 8192 (the size ogn-rf uses at 2 MSPS)\n");
             printf("       -G N   Welch segments to average, default 32\n");
@@ -697,6 +869,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot create a %zu-sample buffer\n", bufsz);
         iio_context_destroy(ctx); return 1;
     }
+
+#ifdef USE_FFTW
+    if (monitor_secs > 0) {
+        for (int k = 0; k < 4; k++) if (iio_buffer_refill(buf) < 0) break;    /* flush stale data */
+        int rc = run_monitor(buf, p.i, p.q, fft_size, monitor_secs,
+                             (have_rate && got_rate > 0) ? (double)got_rate : rate,
+                             have_freq ? (uint32_t)got_freq : freq,
+                             ldexp(1.0, (int)p.bits - 1));
+        iio_channel_disable(p.i); iio_channel_disable(p.q);
+        iio_buffer_destroy(buf); iio_context_destroy(ctx);
+        return rc;
+    }
+#else
+    if (monitor_secs > 0) { printf("  -M needs FFTW (built without USE_FFTW)\n"); return 2; }
+#endif
 
     /* Discard whatever is queued from before the retune, so the capture is the frequency we asked
      * for. This is the same "reset the buffer" discipline ogn-rf performs before every Read(). */

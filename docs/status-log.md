@@ -652,3 +652,58 @@ when the crest factor collapses — rare, explicit, and reportable, rather than 
 One reporting bug fell out of this: the probe printed `gain_control_mode` *before* configuring, so
 every run showed the previous run's mode and made `fast` look like `slow`. It now reports the mode
 after applying it, which is the only reading that means anything.
+
+---
+
+## 2026-11-10 — listening to the 868 band, and choosing a gain from it
+
+Built `pluto_probe -M SECONDS`: a band monitor that keeps a **max-hold spectrum** alongside the
+average, because the traffic that matters is bursty and low-duty-cycle, and an averaged spectrum
+hides exactly that. Two bugs in it had to be fixed first, and both produced confident wrong numbers.
+
+1. **It FFT'd only the first 8192 samples of each 262144-sample block** — 3% of the time. The
+   time-domain peak was always sound (that loop covers every sample), but the spectral view was
+   sampling one instant in thirty, so a burst had to be lucky to be seen.
+2. **The frequency axis was off by half the sample rate.** FFTW returns natural order and the code
+   treated the array as already fftshifted, which shifted every reported frequency by ±fs/2 = ±1 MHz
+   and put the DC guard in the wrong place. Every interferer frequency in earlier drafts of this log
+   was wrong, which is why "narrowing the filter" appeared not to reject anything. Verified fixed the
+   only way that means anything: one narrowband signal reads **868.0940 / 868.0939 / 868.0941 MHz**
+   at LO 868.0, 868.3 and 868.6 — stable to 0.1 kHz across three tunings.
+
+### What is actually there
+
+868.3 ± 1 MHz, 10-minute max-hold runs, correct axis:
+
+- persistent carriers at **868.09, 868.84 and 868.93 MHz**, up to **78 dB** above the noise floor
+- noise floor −79.4 dBFS/bin, typical block peak 3.4 %FS at 73 dB gain
+- and **sporadic bursts that reach full scale**: the ADC clipped at 100 %FS twice, at 70 and 73 dB
+
+Worst single-sample peak per five-minute window, across the whole session:
+
+| gain | worst peak seen | note |
+|---|---|---|
+| 73 dB | 34.8 %, and **100 % (clipped)** in a longer run | clip events observed twice |
+| 66 dB | 14.9 % | |
+| 63 dB | 67.7 % | |
+| 60 dB | 49.7 % | |
+| 40 dB | 0.8 % over 7 min | no loud event landed in that window |
+
+The spread between windows is the point: the loud transmitters are sporadic, so no five-minute sample
+is representative and a single measurement of "the" peak would be a lie.
+
+### The gain, and a reinterpretation of the AGC
+
+`slow_attack` kept parking around 63 dB, which an earlier entry here called "10 dB of sensitivity left
+on the table". That was wrong. It was the AGC backing off because of this real in-band energy, and it
+had independently arrived at roughly the gain this listening exercise does. The complaint that stands
+is narrower: it dithers ±2 dB continuously, which a noise-floor-referenced demodulator cannot use. The
+number it chose was fine; only its refusal to sit still was not.
+
+So the shipped gain is now **63 dB**, not 73: the worst burst seen at that setting reached 67.7 %FS
+rather than clipping, and the sensitivity cost is about 1.4 dB. 73 dB remains defensible — clipping
+lasts milliseconds against a 0.85 s time slot — and is recorded as the quiet-site option.
+
+The lasting answer is a **software gain guard**: measure the crest factor and a saturate counter,
+step the manual gain down when they trip, and log it. That is the protection AGC provides, minus the
+hunting, and with a gain history the demodulator can be told about.

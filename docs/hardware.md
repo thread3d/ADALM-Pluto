@@ -58,6 +58,29 @@ decimation stage on-chip. An earlier version of this file claimed 2.0 MSPS was i
 true only of the attribute, and wrong about the chip. (The library is installed here:
 `/usr/include/ad9361.h`, `libad9361.so`.)
 
+**And the floor moves once the FIR is loaded.** After `ad9361_set_bb_rate()` has run,
+`sampling_frequency_available` reports **`[520833 1 30720000]`** instead of `[2083333 1 61440000]`:
+520 833 Hz is 25 MHz ÷ 48, i.e. the full HB-plus-FIR decimation chain, and the ceiling drops to
+30.72 MSPS because the FIR constrains it. So the real range of this chip is **0.52 – 30.72 MSPS**,
+not 2.08 – 61.44, and the 2.083 figure is only what the attribute allows when no FIR is loaded.
+
+### Listening to the band: `-M`
+
+Choosing a gain by reasoning about it is guesswork; the band has to be listened to. `pluto_probe -M
+SECONDS` runs for a while and keeps a **max-hold spectrum** alongside the average, because the
+traffic that matters here is bursty and low-duty-cycle — garage door openers, weather sensors, smart
+meters — and an averaged spectrum hides exactly that. It reports:
+
+- the strongest single sample seen in the whole run, as a percentage of full scale (this is what
+  decides whether a fixed gain clips);
+- the median block peak, and how many blocks exceeded four times it (i.e. bursts);
+- the strongest bins ever seen, with both max-hold and average, so a persistent carrier and a
+  once-a-minute burst are told apart.
+
+```bash
+./pluto_probe -u usb:1.32.5 -f 868300000 -g 73 -B 2000000 -b 4000000 -M 600
+```
+
 ### Why exactly 2.000 MSPS decides itself: the FFT size
 
 `Inp_FFT::Preset()` in `ogn-rf.cc` computes
@@ -255,6 +278,47 @@ rare and explicit gain changes the demodulator can be told about, instead of con
 
 So the shipped configuration stays `GainMode = manual` at 73 dB, which is also what `ogn-rf` requires,
 and the AGC modes remain available through `-g auto|fast|hybrid` for surveying.
+
+### What is actually in the 868 band here
+
+The band is not quiet, and that changes the gain choice. Max-hold monitoring of 868.3 ± 1 MHz
+(ten-minute runs, correct frequency axis — see the note on the axis bug below):
+
+- **persistent carriers at 868.09, 868.84 and 868.93 MHz**, up to **78 dB above the noise floor**
+- averaged noise floor −79.4 dBFS/bin; typical 130 ms block peak 3.4 %FS at 73 dB gain
+- **sporadic bursts that reach full scale**: the ADC clipped at 100 %FS twice, at 70 dB and 73 dB
+
+Worst single-sample peak per five-minute window over the whole session:
+
+| gain | worst peak seen | note |
+|---|---|---|
+| 73 dB | 34.8 %, and **100 % (clipped)** in a longer run | clipped twice across the session |
+| 66 dB | 14.9 % | |
+| 63 dB | 67.7 % | |
+| 60 dB | 49.7 % | |
+| 40 dB | 0.8 % over 7 min | no loud event fell in that window |
+
+**The spread between windows is the finding.** The loud transmitters are sporadic, so no five-minute
+sample is representative and any single "measured peak" is an accident of when you looked. What can
+be said firmly is that max gain clips on this site and something around 60–63 dB does not.
+
+That also explains the AGC. `slow_attack` kept parking around 63 dB, which an earlier entry here
+called "leaving 10 dB on the table". It was not lazy: it was backing off because of real in-band
+energy, and it had independently landed on the gain this listening exercise does. The valid criticism
+is narrower — it dithers ±2 dB continuously, which a noise-floor-referenced demodulator cannot use.
+The number it picked was right; only its refusal to sit still was not.
+
+### A frequency-axis bug worth knowing about
+
+The monitor's first version reported every frequency **1 MHz** off (half the sample rate): FFTW
+returns natural order, and the code treated the array as already fftshifted, which also put the DC
+guard in the wrong place. Interferers therefore appeared far from where they were and "narrowing the
+analogue filter" seemed not to reject anything — the interferers had been reported 375–830 kHz from
+their true positions.
+
+The fix is verified the only way that means anything: a single narrowband signal reads
+**868.0940 / 868.0939 / 868.0941 MHz** at LO 868.0, 868.3 and 868.6 — stable to 0.1 kHz across three
+tunings. Any future spectral work should re-run that check before trusting a frequency.
 
 ### Real RF, verified
 
