@@ -1,0 +1,21 @@
+# Build output
+/pluto_probe
+*.o
+*.a
+*.so
+*.so.*
+
+# Received I/Q captures (they are large and reproducible with probe-pluto.sh)
+*.u8
+*.s16
+*.iq
+*.bin
+
+# Anything the probe writes by default
+/captures/
+/reports/
+
+# Editor and OS litter
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,17 @@
+# Analog Devices ADALM-PLUTO (PlutoSDR), and the rest of ADI's USB equipment.
+#
+# The Pluto is a libusb/IIO device: no kernel driver claims it, so the ownership of the
+# /dev/bus/usb/BBB/DDD node is the entire access-control story. Ubuntu ships rules for RTL-SDR,
+# SDRplay and osmosdr, but none for Analog Devices, so out of the box the node belongs to root and
+# every tool that touches the radio has to run as root. ogn-rf does not, and should not.
+#
+# Matching the vendor ID rather than a single product ID is deliberate. The radio was observed as
+# 0456:B673 running its normal firmware, but a Pluto in its firmware-update / mass-storage mode can
+# enumerate under a different product ID — a rule that named only B673 would leave the device
+# inaccessible at exactly the moment access matters most, which is when it needs reflashing.
+#
+# MODE and GROUP make it usable by anyone in plugdev; TAG+="uaccess" additionally grants the user
+# holding the seat, which is what makes it work from a graphical session without a group change.
+# Installed by scripts/install-pluto-udev.sh.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="0456", MODE="0664", GROUP="plugdev", TAG+="uaccess"
