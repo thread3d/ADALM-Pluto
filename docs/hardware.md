@@ -129,13 +129,17 @@ software step is unavoidable if ogn-rf is to run at exactly 2.0. The cost of eac
 | Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
 |---|---|---|---|---|---|
 | 2 083 333 | **÷12** | none — but the rate is 2.0833, not 2.0 | 2 083 333 | 8 MB/s | needs ogn-rf at a non-round rate: `SpectrogramFFTsize` becomes 1066, not 1024 |
-| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | **recommended** — exact, cheap, 4× USB headroom |
-| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | at the USB ceiling for no gain |
+| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | safest — most USB headroom for other radios |
+| **6 000 000** | ÷8 | **÷3 box** | **2 000 000** | **23 MB/s** | **highest decimation that works** — see below |
+| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | **loses ~4 % of samples** — see the measured grid below |
 | 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | link delivers 8 MSPS, not 61 |
 
-4.0 MSPS ÷ 2 is the sweet spot for a reason that is not arbitrary: **8 × 2 000 000 / 15 625 = 1024
-exactly**, so ogn-rf's spectrogram is a power-of-two FFT as its author intended. At 2.0833 MSPS the
-same expression gives 1066, and at the RTL-SDR's 2.048 it gives 1048.
+Any of these lands on ogn-rf's natural rate for a reason that is not arbitrary: **8 × 2 000 000 /
+15 625 = 1024 exactly**, so the spectrogram is a power-of-two FFT as its author intended. At
+2.0833 MSPS the same expression gives 1066, and at the RTL-SDR's 2.048 it gives 1048.
+
+Which chip rate to use within that group is a measured question, not a stylistic one — and the answer
+turned out to be the *higher* one, up to a hard ceiling. See the next section.
 
 **Measured, with the ÷2 stage implemented in `pluto_probe -D 2`:**
 
@@ -148,6 +152,57 @@ chip 3 999 999 Hz  ->  1 000 000 samples out at exactly 2 000 000 Hz
 The averaged stream is ~1/√2 of the input as a box filter over independent noise should be, the
 crest factor holds, and nothing clips. The box filter is the same shape as ogn-rf's own
 `boxfilter.h`.
+
+### How far the decimation can go: 6 MSPS ÷ 3 is the ceiling
+
+Every chip rate that divides exactly to 2.0 MSPS, each captured for at least 2 seconds of data:
+
+| Chip rate | Decim | Delivered | Overhead | Real output rate | Verdict |
+|---|---|---|---|---|---|
+| 4 000 000 | ÷2 | 98.4 % | +33 ms | 1.968 MSPS | clean |
+| **6 000 000** | **÷3** | **99.4 %** | **+12 ms** | **1.988 MSPS** | **clean — the best of them** |
+| 8 000 000 | ÷4 | 95.8 % | +86 ms | 1.930 MSPS | **loses ~4 %** |
+| 10 000 000 | ÷5 | 78.0 % | +563 ms | 1.561 MSPS | loses 22 % |
+| 12 000 000 | ÷6 | 65.3 % | +1063 ms | 1.306 MSPS | loses 35 % |
+| 16 000 000 | ÷8 | 48.6 % | +2113 ms | 0.973 MSPS | loses 51 % |
+
+The borderline three repeated three times each, because one run is not evidence:
+
+```
+4 MSPS /2 : 98.4%/+33ms ok    98.3%/+34ms ok    98.4%/+33ms ok
+6 MSPS /3 : 99.4%/+12ms ok    99.4%/+12ms ok    99.4%/+12ms ok
+8 MSPS /4 : 96.1%/+81ms LOSS  95.9%/+85ms LOSS  95.6%/+92ms LOSS
+```
+
+So **6 MSPS ÷ 3 is the highest decimation that still delivers exactly 2.0 MSPS**, and it is not a
+marginal case: 99.4 % delivered with 12 ms of overhead, reproducible. 8 MSPS sits on the edge of what
+the link carries and drops about 4 % of samples — and a stream with holes in it is worse for ogn-rf
+than a slower one, because a time slot that is missing samples does not decode.
+
+Above 8 MSPS the requested rate is simply not delivered: the real output rate falls to 1.56 / 1.31 /
+0.97 MSPS for requests of 10 / 12 / 16 MSPS. Asking for a higher rate makes the receiver *slower*,
+which is the opposite of the intuition that started this test.
+
+### Telling buffering latency from lost samples
+
+A short capture reads below 100 % for a reason that is not loss, and getting this wrong makes a
+healthy link look broken — the probe did exactly that for a while:
+
+```
+wall = n / rate + L          L is a fixed startup latency  -> the shortfall SHRINKS with length
+wall = n / (k x rate)        k < 1, samples dropped        -> the shortfall is CONSTANT
+```
+
+Measured at 4 MSPS: 95.2 % over 0.5 s and 98.4 % over 2 s — the same ~33 ms of latency, not a bigger
+loss. At 10 MSPS the excess *grew* with length (0.162 s over 0.6 s of data, 0.328 s over 1.2 s),
+which is loss. So the probe now reports overhead in milliseconds and only declares loss when the
+capture is long enough (≥1.5 s of data) for a fixed latency to be small.
+
+One more caveat worth carrying: **that ~31 MB/s ceiling is shared with every other SDR on this
+board.** The RSPduo, the LimeSDR and five RTL-SDRs were unplugged for these measurements. 6 MSPS
+÷ 3 uses 23 MB/s of the ~31, leaving little room for anything else; 4 MSPS ÷ 2 uses 15 MB/s and
+leaves twice the headroom for the same 2.0 MSPS output. If other radios are streaming at the same
+time, 4 ÷ 2 is the safer choice.
 
 ### Gain: measured, and the law is not a straight line
 

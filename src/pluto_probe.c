@@ -494,9 +494,17 @@ int main(int argc, char **argv)
             iio_channel_disable(ch);          /* keep the layout to exactly I and Q */
     }
 
-    struct iio_buffer *buf = iio_device_create_buffer(p.rx, (size_t)want, false);
+    /* Read in modest blocks and refill repeatedly, rather than asking for one giant buffer.
+     *
+     * This is both how ogn-rf actually reads (a Read() of one time-slot's worth, over and over) and
+     * a correctness fix: a single huge buffer made this probe report throughput ABOVE the requested
+     * rate, because iio_buffer_end() marks the end of the allocation, not the amount a refill
+     * actually filled - so the walk was reading stale samples past the valid region. Blocks make
+     * "samples read" mean "samples the link delivered". */
+    size_t bufsz = (size_t)want < 262144 ? (size_t)want : 262144;
+    struct iio_buffer *buf = iio_device_create_buffer(p.rx, bufsz, false);
     if (!buf) {
-        fprintf(stderr, "cannot create a %ld-sample buffer\n", want);
+        fprintf(stderr, "cannot create a %zu-sample buffer\n", bufsz);
         iio_context_destroy(ctx); return 1;
     }
 
@@ -506,18 +514,11 @@ int main(int argc, char **argv)
         if (iio_buffer_refill(buf) < 0) break;
     }
 
-    printf("\ncapturing %ld samples...\n", want);
+    printf("\ncapturing %ld samples in %zu-sample blocks...\n", want, bufsz);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (iio_buffer_refill(buf) < 0) {
-        fprintf(stderr, "iio_buffer_refill() failed\n");
-        iio_buffer_destroy(buf); iio_context_destroy(ctx); return 1;
-    }
 
     const ptrdiff_t step = iio_buffer_step(buf);
-    char *pi = iio_buffer_first(buf, p.i);
-    char *pq = iio_buffer_first(buf, p.q);
-    char *end = iio_buffer_end(buf);
 
     struct stats si, sq;
     stats_init(&si); stats_init(&sq);
@@ -534,36 +535,47 @@ int main(int argc, char **argv)
 
     /* The decimation stage, if any. A box filter of N samples per output sample: cheap, and exactly
      * the shape ogn-rf's own boxfilter.h uses. Statistics are taken on the DECIMATED stream, because
-     * that is what ogn-rf will actually see - reporting the chip-rate figures would flatter it. */
+     * that is what ogn-rf will actually see - reporting the chip-rate figures would flatter it.
+     * The accumulator lives outside the refill loop so a box can span a block boundary. */
     long long acc_i = 0, acc_q = 0;
     int acc_n = 0;
     long long n_out = 0;
-    for (; pi < end && pq < end && n < want; pi += step, pq += step, n++) {
-        int16_t vi, vq;
-        memcpy(&vi, pi, sizeof(vi));
-        memcpy(&vq, pq, sizeof(vq));
+    int refills = 0;
 
-        acc_i += vi; acc_q += vq;
-        if (++acc_n < decim) continue;      /* still filling the box */
+    while (n < want) {
+        if (iio_buffer_refill(buf) < 0) break;
+        refills++;
+        char *pi = iio_buffer_first(buf, p.i);
+        char *pq = iio_buffer_first(buf, p.q);
+        char *end = iio_buffer_end(buf);
 
-        const double di = (double)acc_i / decim;
-        const double dq = (double)acc_q / decim;
-        acc_i = acc_q = 0; acc_n = 0;
-        n_out++;
+        for (; pi < end && pq < end && n < want; pi += step, pq += step, n++) {
+            int16_t vi, vq;
+            memcpy(&vi, pi, sizeof(vi));
+            memcpy(&vq, pq, sizeof(vq));
 
-        stats_add(&si, di);
-        stats_add(&sq, dq);
-        if (di < mn) mn = di;
-        if (dq < mn) mn = dq;
-        if (di > mx) mx = di;
-        if (dq > mx) mx = dq;
+            acc_i += vi; acc_q += vq;
+            if (++acc_n < decim) continue;      /* still filling the box */
 
-        /* Clipping is judged against the significant bits, not the 16-bit container. */
-        if (fabs(di) >= fullscale - 1 || fabs(dq) >= fullscale - 1) clipped++;
+            const double di = (double)acc_i / decim;
+            const double dq = (double)acc_q / decim;
+            acc_i = acc_q = 0; acc_n = 0;
+            n_out++;
 
-        if (out) {
-            uint8_t o[2] = { (uint8_t)(((int)di >> shift) + 128), (uint8_t)(((int)dq >> shift) + 128) };
-            if (fwrite(o, 1, 2, out) != 2) { /* stopped writing; keep capturing */ }
+            stats_add(&si, di);
+            stats_add(&sq, dq);
+            if (di < mn) mn = di;
+            if (dq < mn) mn = dq;
+            if (di > mx) mx = di;
+            if (dq > mx) mx = dq;
+
+            /* Clipping is judged against the significant bits, not the 16-bit container. */
+            if (fabs(di) >= fullscale - 1 || fabs(dq) >= fullscale - 1) clipped++;
+
+            if (out) {
+                uint8_t o[2] = { (uint8_t)(((int)di >> shift) + 128), (uint8_t)(((int)dq >> shift) + 128) };
+                if (fwrite(o, 1, 2, out) != 2) { /* stopped writing; keep capturing */ }
+            }
         }
     }
     if (out) {
@@ -588,6 +600,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    int bad = 0;
     const double rms_i = stats_rms(&si), rms_q = stats_rms(&sq);
     const double mean_i = stats_mean(&si), mean_q = stats_mean(&sq);
     const double peak = (mn > -mx ? -mn : mx);            /* largest magnitude seen */
@@ -597,23 +610,59 @@ int main(int argc, char **argv)
     const double dur = have_rate && got_rate > 0 ? (double)n / (double)got_rate : 0.0;
 
     if (decim > 1)
-        printf("\n%lld samples out after decimating by %d: %.0f Hz out, from %d chip-rate samples "
+        printf("\n%lld samples out after decimating by %d: %.0f Hz nominal, from %d chip-rate samples "
                "(%.3f s at %lld Hz), %u-bit, full scale %.0f\n",
                n_out, decim, out_rate, (int)n, dur, have_rate ? got_rate : 0LL, p.bits, fullscale);
     else
         printf("\n%d samples (%.3f s at %lld Hz), %u-bit, full scale %.0f\n",
                (int)n, dur, have_rate ? got_rate : 0LL, p.bits, fullscale);
+
+    /* THE NUMBER THAT MATTERS. The chip was told to run at got_rate; samples reach the host at
+     * n/wall. If that is short, the link could not carry the stream and the device dropped samples -
+     * which for ogn-rf is worse than a slow rate, because a time slot with holes in it does not
+     * decode. Reporting the applied rate as though it were achieved is how a probe lies. */
+    /* Distinguishing lost samples from buffering latency, which a short capture cannot do:
+     *
+     *   wall  =  n / rate  +  L        L = fixed startup latency -> shortfall SHRINKS with length
+     *   wall  =  n / (k*rate)          k < 1, lost samples      -> shortfall is CONSTANT
+     *
+     * So the percentage alone is meaningless. What is reported here is the overhead in milliseconds,
+     * and the verdict is only declared when the capture is long enough (>= 1.5 s of data) for a
+     * fixed latency to be a small part of it. A short capture that reads 95 % has lost nothing. */
+    const double achieved_chip = wall > 0 ? (double)n / wall : 0.0;
+    int lost = 0;
+    if (have_rate && got_rate > 0) {
+        const double data_time = (double)n / (double)got_rate;
+        const double overhead_ms = (wall - data_time) * 1000.0;
+        const double ratio = achieved_chip / (double)got_rate;
+        printf("  chip rate  : %lld Hz requested, %.0f Hz delivered over %.3f s of data (%.1f %%), "
+               "overhead %+.0f ms\n", got_rate, achieved_chip, data_time, 100.0 * ratio, overhead_ms);
+        if (decim > 1)
+            printf("  output rate: %.1f Hz delivered\n", achieved_chip / decim);
+        if (data_time >= 1.5 && ratio < 0.97) {
+            printf("               ^ the shortfall grew with capture length, so these are LOST SAMPLES:\n"
+                   "                 the link cannot carry %lld Hz and the stream has holes in it.\n", got_rate);
+            lost = 1;
+        } else if (ratio < 0.97) {
+            printf("               ^ a short capture: a fixed ~%.0f ms of buffering latency explains this.\n"
+                   "                 Capture >= 1.5 s of data to tell latency from loss.\n", overhead_ms);
+        }
+    }
     /* The achieved rate is what USB actually sustained - the number that says whether a given
      * sampling_frequency is usable or merely accepted. */
     printf("  throughput: %.3f Msps sustained over %.3f s of wall time (%.1f MB/s)\n",
            achieved / 1e6, wall, achieved * 2.0 * (p.bits > 8 ? 2.0 : 1.0) / 1e6);
+    if (lost) {
+        printf("  FAIL: %lld Hz is not sustainable over this link, so samples are being dropped.\n",
+               got_rate);
+        bad = 1;
+    }
     printf("  I: mean %9.1f  rms %9.1f  min %8.0f  max %8.0f\n", mean_i, rms_i, si.mn, si.mx);
     printf("  Q: mean %9.1f  rms %9.1f  min %8.0f  max %8.0f\n", mean_q, rms_q, sq.mn, sq.mx);
     printf("  level: rms %.1f %%FS, peak %.1f %%FS, crest %.2f, clipped %lld samples\n",
            100.0 * rms / fullscale, 100.0 * peak / fullscale, crest, clipped);
 
     /* The checks that catch the common real failures. */
-    int bad = 0;
     if (mx == mn) {
         printf("  FAIL: every sample is identical (%.0f) - the stream is stuck or all zeros.\n", mx);
         bad = 1;
