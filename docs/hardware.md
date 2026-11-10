@@ -218,6 +218,44 @@ S/N is flat from 60 to 73 dB while the peak sample climbs from 22 % to 86 % of f
 the right answer; in the presence of a strong local interferer the same settings would compress, and
 the crest factor is the alarm to watch.
 
+### AGC: it exists, it works, and it is wrong for a pulsed receiver
+
+The AD9361 has three built-in automatic gain modes — `manual`, `fast_attack`, `slow_attack`,
+`hybrid` — plus **183 debug attributes** on this driver, around forty of which tune the AGC itself
+(`adi,agc-inner-thresh-high`, `adi,agc-attack-delay-extra-margin-us`,
+`adi,agc-gain-update-interval-us`, `adi,agc-dig-gain-step-size`, the `adi,fagc-*` fast-attack set),
+with `gaininfo_rx1` reporting the gain index in use. So the answer to "can it do AGC" is yes,
+thoroughly.
+
+Measured behaviour, reading `hardwaregain` every 100 ms:
+
+| Situation | Mode | Behaviour |
+|---|---|---|
+| strong band (100 MHz FM) | `manual` | stays at whatever you set; peak 78.5 %FS at 73 dB |
+| strong band | `fast_attack` | settles at **68 dB** within one sample, ±2 dB hunting, one 8 dB transient |
+| strong band | `slow_attack` | **never settles**: dithers 61–66 dB continuously |
+| quiet band (868.4 MHz) | `slow_attack` | **settles ~63 dB**, not the 73 dB a manual setting gives — and dithers 62–66 dB |
+| quiet band | `fast_attack` / `hybrid` | likewise converges to the mid-70s at best, then hunts |
+
+Two of those matter and both point the same way:
+
+1. **On the quiet OGN band the AGC does not go to maximum gain.** It parks around 63 dB, ten dB below
+   what a fixed setting gives. Because input-referred noise saturates above ~65 dB that costs only
+   about 1 dB of S/N — but it is 1 dB given away for nothing.
+2. **It hunts, continuously, by ±2 dB.** `slow_attack` never converged in 2.4 s of sampling. A
+   demodulator that measures a noise floor and thresholds pulses against it — which is exactly what
+   `ogn-rf` does — cannot tolerate its noise reference moving ±2 dB between time slots. This is not a
+   tuning opinion; it is the measurement above.
+
+Where AGC *is* right: bring-up and surveying (it cannot overload the ADC), and protection against a
+strong local interferer. For that second one the better shape for this application is a **software
+gain guard** in the backend — watch the crest factor and the full-scale count, and step the MANUAL
+gain down a dB at a time when they collapse. That gives the same protection deterministically, with
+rare and explicit gain changes the demodulator can be told about, instead of continuous dithering.
+
+So the shipped configuration stays `GainMode = manual` at 73 dB, which is also what `ogn-rf` requires,
+and the AGC modes remain available through `-g auto|fast|hybrid` for surveying.
+
 ### Real RF, verified
 
 The radio is not merely delivering noise. At maximum gain, 4 MSPS, 300 000 samples:

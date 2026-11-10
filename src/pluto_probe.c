@@ -233,6 +233,12 @@ static void describe_context(struct iio_context *ctx)
         }
         /* Device-level attributes. This is how you find out what an attribute is really called:
          * guessing "gain_control_mode" and getting a silent failure costs an afternoon. */
+        unsigned int ndbg = iio_device_get_debug_attrs_count(d);
+        if (ndbg) {
+            printf("      debug attributes (%u):", ndbg);
+            for (unsigned int a = 0; a < ndbg; a++) printf(" %s", iio_device_get_debug_attr(d, a));
+            printf("\n");
+        }
         unsigned int na = iio_device_get_attrs_count(d);
         if (na) {
             printf("      device attributes (%u):", na);
@@ -501,6 +507,7 @@ int main(int argc, char **argv)
     int fft_size = 8192;        /* -F: FFT length, same default as ogn-rf's Inp_FFT */
     int segs = 32;              /* -G: Welch segments to average */
     const char *rx_port = NULL; /* -P: rf_port_select, e.g. A_BALANCED or A_N */
+    const char *gain_mode_name = "slow_attack"; /* which AGC mode -g auto/fast/hybrid selects */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-u")) uri = opt(argc, argv, &i);
@@ -508,7 +515,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-r")) rate = (uint32_t)strtoul(opt(argc, argv, &i), NULL, 0);
         else if (!strcmp(argv[i], "-g")) {
             const char *v = opt(argc, argv, &i);
-            if (!strcasecmp(v, "auto")) gain_auto = 1; else gain = strtoll(v, NULL, 0);
+            if (!strcasecmp(v, "auto"))        { gain_auto = 1; gain_mode_name = "slow_attack"; }
+            else if (!strcasecmp(v, "fast"))   { gain_auto = 1; gain_mode_name = "fast_attack"; }
+            else if (!strcasecmp(v, "hybrid")) { gain_auto = 1; gain_mode_name = "hybrid"; }
+            else                               { gain = strtoll(v, NULL, 0); }
         }
         else if (!strcmp(argv[i], "-b")) bw = (uint32_t)strtoul(opt(argc, argv, &i), NULL, 0);
         else if (!strcmp(argv[i], "-n")) want = strtol(opt(argc, argv, &i), NULL, 0);
@@ -626,8 +636,8 @@ int main(int argc, char **argv)
             printf("  rf_port_select = %s\n", rx_port);
     }
     if (gain_auto) {
-        if (write_gain_mode(&p, "slow_attack") < 0)
-            fprintf(stderr, "  could not select automatic gain\n");
+        if (write_gain_mode(&p, gain_mode_name) < 0)
+            fprintf(stderr, "  could not select %s\n", gain_mode_name);
     } else if (gain >= 0 && p.rx0) {
         if (write_gain_mode(&p, "manual") < 0)
             fprintf(stderr, "  could not select manual gain mode\n");
@@ -652,6 +662,7 @@ int main(int argc, char **argv)
     /* The internal chain the chip settled on for this data rate: BBPLL, ADC, then each decimation
      * stage. This is the difference between "it decimates on chip" as a belief and as a reading. */
     print_attr_any(NULL, p.dev, "rx_path_rates", "RX path rates after");
+    print_attr_any(p.rx0, p.dev, "gain_control_mode", "gain mode after");
     print_attr_any(p.rx0, p.dev, "filter_fir_en", "RX FIR enabled");
     if (have_rate && got_rate > 0 && got_rate != (long long)rate)
         printf("  NOTE: the device changed the requested rate to %lld Hz\n", got_rate);

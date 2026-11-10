@@ -615,3 +615,40 @@ One measurement was tried and abandoned: carrier-to-noise over the FM band's pea
 9.9 and 18.6 dB non-monotonically with gain, because an FM carrier is modulated and the peak bin moves
 between captures. It is not a usable metric, and the numbers are not in the table above for that
 reason.
+
+---
+
+## 2026-11-10 — AGC: available, measured, and not what OGN wants
+
+Asked whether the Pluto can do automatic gain control. It can, thoroughly: `manual`, `fast_attack`,
+`slow_attack` and `hybrid` are all accepted, and the driver exposes **183 debug attributes**, roughly
+forty of them AGC tuning (`adi,agc-inner-thresh-high`, `adi,agc-attack-delay-extra-margin-us`,
+`adi,agc-gain-update-interval-us`, `adi,agc-dig-gain-step-size`, the `adi,fagc-*` fast-attack group),
+with `gaininfo_rx1` reporting the gain index.
+
+Read `hardwaregain` every 100 ms and the behaviour is plain:
+
+| Situation | Mode | Behaviour |
+|---|---|---|
+| strong band (100 MHz) | `manual` | fixed; peak 78.5 %FS at 73 dB |
+| strong band | `fast_attack` | settles at 68 dB immediately, ±2 dB hunting, one 8 dB transient |
+| strong band | `slow_attack` | **never settles** — dithers 61–66 dB for the whole 2.4 s |
+| quiet band (868.4 MHz) | `slow_attack` | **parks around 63 dB**, not 73, still dithering |
+
+Two findings decide it:
+
+1. **On the quiet OGN band AGC does not take maximum gain.** It sits ~10 dB below what a fixed setting
+   gives. Since input-referred noise saturates above ~65 dB, that costs only ~1 dB of S/N — but it is
+   1 dB given away for free.
+2. **It hunts ±2 dB continuously.** For a demodulator that establishes a noise floor and thresholds
+   pulses against it, a reference moving ±2 dB between time slots is not a tuning detail, it is a
+   fault. `ogn-rf` also explicitly wants manual gain (`RF.OGN.GainMode = 1`).
+
+So the shipped configuration stays manual at 73 dB. AGC keeps two legitimate uses: surveying
+(`-g auto|fast|hybrid`), where never overloading the ADC is worth more than a stable floor; and
+anti-overload protection, better implemented as a **software guard** that steps the manual gain down
+when the crest factor collapses — rare, explicit, and reportable, rather than continuous dithering.
+
+One reporting bug fell out of this: the probe printed `gain_control_mode` *before* configuring, so
+every run showed the previous run's mode and made `fast` look like `slow`. It now reports the mode
+after applying it, which is the only reading that means anything.
