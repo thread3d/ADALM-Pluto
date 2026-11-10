@@ -20,8 +20,8 @@ verified against live hardware.**
 
 | Item | State |
 |---|---|
-| Device identified | **confirmed** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06`, seen at 10:44:55 and again at 11:02:32 |
-| Current USB link | **failing, in two ways** — once configured then dropped after 4 s; once `can't set config #1, error -71`. See [`docs/status-log.md`](docs/status-log.md) |
+| Device identified | **confirmed, three times** — USB `0456:B673`, product `PlutoSDR (ADALM-PLUTO)`, serial `104473ae73930001fdff27009d682d6d06`, at 10:44:55, 11:02:32 and 11:09:58 |
+| Current USB link | **failing on every attempt** — three plugs, three failure modes, worst case about 1 s alive. See [`docs/status-log.md`](docs/status-log.md) |
 | `libiio` runtime | **present** — 0.19-1 (Ubuntu 20.04), libusb backend compiled in |
 | `libiio` headers | **present** — `libiio-dev` 0.19-1, so a backend can be built here |
 | `iio-utils` (`iio_info`, `iio_attr`) | **missing** — not installed; `probe-pluto.sh` works without it |
@@ -54,17 +54,23 @@ the failure modes in `docs/hardware.md` you are looking at.
 
 ## The USB problem, in one paragraph
 
-The Pluto has been seen twice, and failed differently each time — which is the useful part. At
-10:44:55 it identified itself fully, configured, presented its firmware volume, then reported
-`Power-on or device reset occurred` and dropped off the bus four seconds later. On a re-plug at
-11:02:32 it enumerated and then could not configure at all: `can't set config #1, error -71`
-(`EPROTO`), with no string descriptors readable and `bConfigurationValue` left empty. Two failure
-points, both intermittent, the second worse than the first. That is the signature of a marginal
-physical connection, so the cable is now the first thing to change — not the last. The
-brown-out-on-a-bus-powered-hub theory that this file used to lead with does not survive the
-descriptors: every hub above the Pluto declares itself **self-powered**. `docs/status-log.md` has the
-kernel lines, the descriptor table and an ordered, cheap-first list of what to try. It also notes the
-one genuinely good port choice: the two USB3.2 hubs on bus 002 are self-powered and completely unused.
+The Pluto has been plugged in three times and failed differently each time — which is the useful
+part. At 10:44:55 it identified itself fully, configured, presented its firmware volume, then reported
+`Power-on or device reset occurred` and dropped off the bus four seconds later. At 11:02:32 it
+enumerated and could not configure at all (`can't set config #1, error -71`, `EPROTO`), with no string
+descriptors readable. At 11:09:58, **with the RSPduo, the LimeSDR and all five RTL-SDRs unplugged**, it
+configured, bound its storage volume, and dropped again inside a second.
+
+That last attempt is the decisive one: the radio had the bus to itself and still fell off, faster than
+before. So the host's power budget is not the cause, and neither is anything about the other devices.
+Two theories this file has had to abandon, both recorded rather than deleted: the hub was not
+bus-powered (every hub above the Pluto declares `bmAttributes 0xE0`, self-powered), and an empty bus
+did not help. What is left is physical and device-side — the cable (never yet changed), the radio's
+own supply, or its firmware — plus one host-side item never actually tried: a **direct root port**,
+since all three attempts used the same `1-4.4.3` behind two hubs. Bus 001 port 3 is free now.
+`docs/status-log.md` has the kernel lines, the descriptor table and the per-attempt comparison.
+`scripts/watch-pluto.sh` exists because the device now lives about a second, which is too short to
+inspect by hand.
 
 ## Why this radio is different
 
@@ -96,6 +102,7 @@ Four properties of the Pluto shape everything here, and none of them applied to 
 | `docs/status-log.md` | Dated observations, including the USB failure of 2026-11-10 |
 | `docs/ogn-rf-integration.md` | The design for the `adalm-pluto` branch: the contract, the mapping, the open questions |
 | `scripts/probe-pluto.sh` | Read-only diagnosis of the link; then, with `--capture`, a live receive check |
+| `scripts/watch-pluto.sh` | Samples the USB/IIO/serial/block state five times a second — for a device that lives one second |
 | `scripts/install-pluto-udev.sh` | One-time root install of the udev rule that lets `threaded` open the radio |
 | `config/90-libiio-pluto.rules` | The udev rule itself |
 | `config/ogn-rf-pluto.conf` | An ogn-rf configuration for this board, with the reasons for each value |

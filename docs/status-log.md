@@ -197,3 +197,64 @@ Everything in `docs/ogn-rf-integration.md`'s "Open questions" list, for the same
 `sampling_frequency_available`, the gain range and the conversion scale all live on the device, and
 the device has to survive configuration before any of them can be read. The tooling to read them the
 moment it does — `probe-pluto.sh --capture` — is written, compiled and waiting.
+
+---
+
+## 2026-11-10 11:09 — re-seated with the rest of the bus emptied
+
+By hand: RTL-SDR bank, LimeSDR and RSPduo unplugged, then the Pluto re-seated. It failed again, and
+the failure is now much better constrained.
+
+```
+Nov 10 11:09:14 xavieragx kernel: usb 1-4.3.5: new high-speed USB device number 27 ... RTL2838UHIDIR
+Nov 10 11:09:23 xavieragx kernel: usb 1-4.3:   USB disconnect, device number 23   <- RTL bank gone
+Nov 10 11:09:25 xavieragx kernel: usb 1-4.4.1: USB disconnect, device number 8    <- LimeSDR gone
+Nov 10 11:09:27 xavieragx kernel: usb 1-4.4.2: USB disconnect, device number 14   <- RSPduo gone
+Nov 10 11:09:42 xavieragx kernel: usb 1-4.4.3: USB disconnect, device number 22   <- Pluto unplugged
+Nov 10 11:09:57 xavieragx kernel: usb 1-4.4.3: new high-speed USB device number 29 using tegra-xusb
+Nov 10 11:09:58 xavieragx kernel: usb 1-4.4.3: New USB device found, idVendor=0456, idProduct=b673, bcdDevice= 6.01
+Nov 10 11:09:58 xavieragx kernel: usb 1-4.4.3: Product: PlutoSDR (ADALM-PLUTO)
+Nov 10 11:09:58 xavieragx kernel: usb 1-4.4.3: Manufacturer: Analog Devices Inc.
+Nov 10 11:09:58 xavieragx kernel: usb 1-4.4.3: SerialNumber: 104473ae73930001fdff27009d682d6d06
+Nov 10 11:09:58 xavieragx kernel: usb-storage 1-4.4.3:1.2: USB Mass Storage device detected
+Nov 10 11:09:58 xavieragx kernel: scsi host0: usb-storage 1-4.4.3:1.2
+Nov 10 11:09:59 xavieragx kernel: usb 1-4.4.3: USB disconnect, device number 29
+```
+
+| | 10:44:55 | 11:02:32 | **11:09:58** |
+|---|---|---|---|
+| Other devices on the bus | 5 RTL-SDRs, LimeSDR, RSPduo | same | **none — keyboard and mouse only** |
+| String descriptors read | yes | no | **yes** |
+| Configured | yes, storage bound | no, `EPROTO` | **yes, storage bound** |
+| Survived | ~4 s | never | **~1 s** |
+
+### What this settles
+
+The shared-current explanation is now dead. At 11:09 the radio had the whole bus to itself — no
+RSPduo, no LimeSDR, five fewer dongles — and it still fell off, faster than before. Whatever is wrong
+does not depend on what else is plugged in, so the host's power budget is not the cause and no amount
+of freeing up ports will fix it by itself.
+
+What remains is a short list, and it is no longer about the host at all:
+
+1. **The cable**, still untested — everything so far used the same one.
+2. **The radio's own 5 V rail or USB PHY**, which would explain a reset that arrives sooner as the
+   board gets less stable rather than later.
+3. **The firmware on the device** — it consistently reaches the point of presenting its mass-storage
+   volume and then restarts, which is also what a half-broken boot looks like.
+
+All three are physical. Note also that the port has not changed across any of the three attempts:
+`1-4.4.3`, behind two Realtek hubs. A **direct root port** has not actually been tried yet, and the
+bus is now clear enough that one is free — bus 001 port 3, where the RTL-SDR hub used to be.
+
+### New tooling for a device that lives one second
+
+`scripts/watch-pluto.sh` polls the USB, IIO, serial and block layers five times a second, logs every
+state change with a timestamp, and dumps the descriptors and interface map each time the device
+appears. One to two seconds is far too short to inspect by hand, and this makes the next replug
+produce evidence instead of another shrug:
+
+```bash
+./scripts/watch-pluto.sh -d 300      # then replug the radio while it runs
+grep -A6 "device appeared" pluto-watch-*.log
+```
