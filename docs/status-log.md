@@ -556,3 +556,62 @@ Measured at 100 MHz FM, 2 MSPS, gain 73 dB:
 
 Also worth noting for the backend: `ad9361_set_bb_rate()` must not be followed by a
 `sampling_frequency` write, which would undo the FIR configuration it just set up.
+
+---
+
+## 2026-11-10 — measuring S/N properly, and what it says
+
+Asked which settings give the best S/N. The probe could not answer it: rms over a capture mixes signal
+and noise into one number, so S/N is not recoverable from it. Added a Welch spectrum analyser (`-S`):
+Hann-windowed, 32 segments of 8192 bins — the same FFT size `Inp_FFT` uses at 2 MSPS — reporting the
+median bin (noise floor), the peak, carrier-to-noise, and density in dBFS/Hz.
+
+It cross-checks itself on every run, and that check earned its place immediately: the first version
+reported a noise floor of **+12 dBFS**, which is impossible, and a spectrum total exactly
+10·log₁₀(8192) = 39.1 dB away from the sample power. Two Parseval mistakes — a missing 1/N and a
+window normalisation by (Σw)² instead of Σw². Now the printed total and the sample power agree to
+0.04 dB, every run. A spectrum analyser without that check is a random number generator with a
+spectrum-shaped interface.
+
+### The measurement
+
+At 868.400 MHz (quiet, so noise only), 2 MSPS, 4 MHz bandwidth, three repeats each — reproducible to
+0.05 dB. The figure of merit for weak signals is *input-referred* noise: measured density minus gain.
+
+| gain | density (dBFS/Hz) | input-referred |
+|---|---|---|
+| 40 | −128.81 | −168.81 |
+| 50 | −120.97 | −170.97 |
+| 55 | −119.10 | −174.10 |
+| 60 | −114.59 | −174.59 |
+| 65 | −110.65 | −175.65 |
+| 70 | −106.15 | −176.15 |
+| 73 | −103.35 | **−176.35** |
+
+Steep to ~55 dB, then flat: the last 18 dB of gain buys 2.25 dB, the last 3 dB buys 0.20 dB. The noise
+figure saturates around 65 dB.
+
+### Everything else is flat
+
+| knob | spread over the range tested |
+|---|---|
+| RX port (A_BALANCED, B_BALANCED, A_N, A_P, B_N) | **0.2 dB** |
+| analogue bandwidth (1 → 56 MHz) | **1.5 dB** |
+| sample rate (1.0, 2.0, 4.0 MSPS) | **0.7 dB** |
+
+So the configuration can be chosen for other reasons — 2.0 MSPS for the power-of-two FFT, 4 MHz for the
+strongest signal at high gain, `A_BALANCED` because it is already the default — without paying for it
+in sensitivity.
+
+### The real trade-off is compression
+
+Against the FM band at 100 MHz, S/N (total power over the quiet-band floor) is flat from 60 to 73 dB
+(24.3, 24.7, 25.1, 25.0 dB) while the peak sample climbs from 21.6 % to 85.9 % of full scale. Past
+~70 dB there is no S/N left to win and only headroom to lose. On this quiet band maximum gain is
+correct; with a strong local interferer the same setting would compress, and the crest factor is the
+alarm.
+
+One measurement was tried and abandoned: carrier-to-noise over the FM band's peak bin swings between
+9.9 and 18.6 dB non-monotonically with gain, because an FM carrier is modulated and the peak bin moves
+between captures. It is not a usable metric, and the numbers are not in the table above for that
+reason.

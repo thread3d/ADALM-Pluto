@@ -28,6 +28,8 @@ captures 12-bit I/Q — verified by reading FM broadcast +23 dB above the noise 
 | **Receive verified** | **yes** — 100 MHz FM reads 12.8 %FS against 0.9 %FS at 868.4 MHz (+23 dB), no clipping at any gain |
 | **Rate: exactly 2.0 MSPS from the chip** | **`ad9361_set_bb_rate(2000000)` → 1 999 999 Hz**, ADC 64 MHz, RX FIR ÷4, no host resampling. The 2 083 333 Hz floor applies only to the plain `sampling_frequency` attribute |
 | Bandwidth | **4 MHz** — measured ~5 dB stronger than 56 MHz at 2 MSPS |
+| **S/N** | **gain is the only knob that matters**, and it saturates near 65 dB (last 18 dB buys 2.25 dB). Port, bandwidth and sample rate are all flat within 1.5 dB |
+| Spectrum tool | `pluto_probe -S` — Welch, 8192 bins, self-checking against the sample power to 0.04 dB |
 | The FFT this buys | `Inp_FFT` uses `(8*8*SampleRate)/15625` → **8192 = 2¹³** at 2.000 MSPS vs 8533 = 7·23·53 at 2.0833 |
 | Gain | **measured −1…73 dB**, 1 dB steps, and not linear in dB; 73 dB clips nothing here |
 | Frequency trim | **`xo_correction` exists** — ±200 ppm at 1 Hz resolution on a 40 MHz XO |

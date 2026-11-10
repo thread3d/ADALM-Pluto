@@ -165,6 +165,59 @@ A crest factor of 4.2–5.2 through that sweep is **normal, not compression**: i
 Gaussian sample divided by its rms over 300k samples, which sits near 4.5. The RSPduo repository's
 "9–11 is healthy, 3–5 is folding" figure came from a different measurement and does not transfer.
 
+### S/N: gain is the only knob that matters, and it saturates around 65 dB
+
+S/N cannot be read off time-domain statistics — rms over a capture mixes signal and noise into one
+number. The probe therefore gained a Welch spectrum analyser (`-S`, Hann-windowed, 32 segments of
+8192 bins, the same FFT size ogn-rf's `Inp_FFT` uses at 2 MSPS) which cross-checks itself on every
+run: the summed spectrum must equal the sample power. It does, to 0.04 dB.
+
+**The metric.** For weak signals what matters is sensitivity, so the figure of comparison is
+*input-referred* noise: the measured noise density in dBFS/Hz minus the gain in dB. Lower is better.
+Measured at 868.400 MHz, 2 MSPS, 4 MHz bandwidth, three repeats each — reproducible to 0.05 dB:
+
+| `hardwaregain` | noise density (dBFS/Hz) | **input-referred** |
+|---|---|---|
+| 40 | −128.81 | −168.81 |
+| 50 | −120.97 | −170.97 |
+| 55 | −119.10 | −174.10 |
+| 60 | −114.59 | −174.59 |
+| 65 | −110.65 | −175.65 |
+| 70 | −106.15 | −176.15 |
+| **73** | −103.35 | **−176.35** |
+
+The improvement is steep up to ~55 dB and then flattens hard: the last 18 dB of gain (55 → 73) buys
+**2.25 dB** of sensitivity, and the last 3 dB (70 → 73) buys 0.20 dB. In other words the noise figure
+saturates near 65 dB and there is nothing to win above it — but nothing to lose either, on a quiet
+band.
+
+**Everything else is flat.** Same conditions, noise density in dBFS/Hz:
+
+| Knob | Range tested | Spread |
+|---|---|---|
+| RX port | A_BALANCED, B_BALANCED, A_N, A_P, B_N | **0.2 dB** (−114.5 … −114.7) |
+| Analogue bandwidth | 1, 2, 4, 8, 18, 56 MHz | **1.5 dB** (−116.1 … −114.6) |
+| Sample rate | 1.0, 2.0, 4.0 MSPS | **0.7 dB** (−115.1 … −114.4) |
+
+So port selection, analogue bandwidth and sample rate do not change S/N measurably on this board. The
+AD9363's own noise figure sets the floor, and once the gain is high enough to dominate the ADC's
+contribution, no other setting moves it. That is worth knowing because it means the configuration can
+be chosen for other reasons — 2.0 MSPS for the power-of-two FFT, 4 MHz bandwidth for the strongest
+signal at high gain, `A_BALANCED` because it is the default — without trading any sensitivity away.
+
+**The trade-off is compression, not noise.** Against the FM band at 100 MHz, S/N measured as total
+power over the quiet-band floor:
+
+| `hardwaregain` | 20 | 30 | 40 | 50 | 60 | 65 | 70 | 73 |
+|---|---|---|---|---|---|---|---|---|
+| S/N (dB) | −0.9 | 7.4 | 20.1 | 21.9 | 24.3 | 24.7 | **25.1** | 25.0 |
+| time-domain peak (%FS) | — | — | — | 7.6 | 21.6 | — | 54.2 | **85.9** |
+
+S/N is flat from 60 to 73 dB while the peak sample climbs from 22 % to 86 % of full scale. Past
+~70 dB there is no S/N left to gain and only headroom to lose. On the quiet OGN band maximum gain is
+the right answer; in the presence of a strong local interferer the same settings would compress, and
+the crest factor is the alarm to watch.
+
 ### Real RF, verified
 
 The radio is not merely delivering noise. At maximum gain, 4 MSPS, 300 000 samples:

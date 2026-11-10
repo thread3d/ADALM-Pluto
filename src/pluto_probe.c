@@ -46,6 +46,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <iio.h>
+#ifdef USE_FFTW
+#include <fftw3.h>
+#endif
 #ifdef USE_AD9361
 #include <ad9361.h>
 #endif
@@ -312,6 +315,8 @@ static void describe_phy(struct phy *p)
         print_attr(p->rx0, NULL, "hardwaregain_available",      "gain available");
         print_attr(p->rx0, NULL, "hardwaregain",                 "gain now");
     }
+    print_attr_any(p->rx0, p->dev, "rf_port_select",             "RX port selected");
+    print_attr_any(p->rx0, p->dev, "rf_port_select_available",   "RX ports available");
     print_attr_any(p->rx0, p->dev, "gain_control_mode",           "gain mode");
     print_attr_any(p->rx0, p->dev, "gain_control_mode_available", "gain modes available");
     print_attr_any(NULL,   p->dev, "rx_path_rates",               "RX path rates");
@@ -350,6 +355,133 @@ static double stats_mean(const struct stats *s) { return s->n ? s->sum / s->n : 
 static double stats_rms(const struct stats *s)  { return s->n ? sqrt(s->sumsq / s->n) : 0.0; }
 
 /* ---------------------------------------------------------------------------------------------- */
+/* spectrum: the only honest way to measure S/N                                                    */
+/* ---------------------------------------------------------------------------------------------- */
+
+#ifdef USE_FFTW
+static int cmp_double(const void *a, const void *b)
+{
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+/* Welch-averaged power spectrum of the captured stream, in dB relative to full scale.
+ *
+ * S/N cannot be read off time-domain statistics: rms over a capture mixes signal and noise into one
+ * number. What matters for a receiver is the signal's spectral power against the noise floor, so this
+ * does what ogn-rf's own SlidingFFT does - Hann-windowed segments, |X|^2, averaged - and then reports
+ * the median (the noise floor) against the peak (the signal).
+ */
+static void report_spectrum(const float *i, const float *q, size_t n,
+                            int fft_size, int segs, double out_rate, uint32_t center,
+                            double fullscale, int verbose)
+{
+    if (n < (size_t)fft_size) {
+        printf("  spectrum: only %zu samples, need %d for one segment\n", n, fft_size);
+        return;
+    }
+    if ((size_t)fft_size * segs > n) segs = (int)(n / fft_size);
+    if (segs < 1) segs = 1;
+
+    fftwf_complex *in  = fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+    fftwf_complex *out = fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+    double        *acc = calloc(fft_size, sizeof(double));
+    double        *win = malloc(sizeof(double) * fft_size);
+    double        *sorted = malloc(sizeof(double) * fft_size);
+    if (!in || !out || !acc || !win || !sorted) { printf("  spectrum: out of memory\n"); return; }
+
+    double winsum2 = 0.0;
+    for (int k = 0; k < fft_size; k++) {
+        win[k] = 0.5 - 0.5 * cos(2.0 * M_PI * k / (fft_size - 1));
+        winsum2 += win[k] * win[k];
+    }
+
+    fftwf_plan plan = fftwf_plan_dft_1d(fft_size, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+    if (!plan) { printf("  spectrum: no FFTW plan\n"); return; }
+
+    double td_power = 0.0;              /* mean power per complex sample, for the cross-check */
+    int used = 0;
+    for (int sg = 0; sg < segs; sg++) {
+        const size_t off = (size_t)sg * fft_size;
+        for (int k = 0; k < fft_size; k++) {
+            /* Scale to [-1,1] first, so dBFS means what it says: 1.0 = full scale. */
+            const double xi = i[off + k] / fullscale;
+            const double xq = q[off + k] / fullscale;
+            td_power += xi * xi + xq * xq;
+            in[k][0] = (float)(xi * win[k]);
+            in[k][1] = (float)(xq * win[k]);
+        }
+        fftwf_execute(plan);
+        for (int k = 0; k < fft_size; k++)
+            acc[k] += (double)out[k][0] * out[k][0] + (double)out[k][1] * out[k][1];
+        used++;
+    }
+    fftwf_destroy_plan(plan);
+
+    /* Parseval, done carefully, because getting it wrong is how a noise floor ends up reading
+     * +12 dBFS or a spectrum total ending up 10*log10(N) away from the sample power:
+     *
+     *   sum_k |X[k]|^2 = N * sum_n |x[n] w[n]|^2          (unnormalised forward DFT)
+     *   sum_k mean_seg |X[k]|^2 = N * P * sum_n w[n]^2
+     *
+     * so dividing by (sum w^2) leaves sum_k acc = N * P, still one factor of N out. Dividing by
+     * (N * sum w^2) makes sum_k acc[k] equal the mean sample power P and each bin a power in dBFS.
+     * A full-scale complex tone then reads 0 dBFS in its bin, and white noise reads P/N per bin.
+     * The printf below cross-checks the total against the samples on every run. */
+    const double norm = 1.0 / ((double)used * winsum2 * (double)fft_size);
+    double acc_sum = 0.0;
+    for (int k = 0; k < fft_size; k++) { acc[k] *= norm; acc_sum += acc[k]; }
+    td_power /= (double)used * fft_size;
+
+    const int dc = fft_size / 2;                 /* fftshift ordering: bin 0 is -fs/2 */
+    const int dc_guard = 4;                      /* ignore the DC skirt from the receiver's offset */
+    memcpy(sorted, acc, sizeof(double) * fft_size);
+    qsort(sorted, fft_size, sizeof(double), cmp_double);
+    const double median = sorted[fft_size / 2];
+    const double p10    = sorted[fft_size / 10];
+    const double p99    = sorted[(fft_size * 99) / 100];
+
+    int peak_bin = -1;
+    for (int k = 0; k < fft_size; k++) {
+        if (k >= dc - dc_guard && k <= dc + dc_guard) continue;
+        if (peak_bin < 0 || acc[k] > acc[peak_bin]) peak_bin = k;
+    }
+    const double bin_hz = out_rate / fft_size;
+    const double peak_f  = center + (peak_bin - dc) * bin_hz;
+
+    const double floor_db = 10.0 * log10(median > 0 ? median : 1e-30);
+    const double p10_db   = 10.0 * log10(p10    > 0 ? p10    : 1e-30);
+    const double p99_db   = 10.0 * log10(p99    > 0 ? p99    : 1e-30);
+    const double peak_db  = 10.0 * log10(acc[peak_bin] > 0 ? acc[peak_bin] : 1e-30);
+    const double cnr      = peak_db - floor_db;
+    const double dens     = floor_db - 10.0 * log10(bin_hz);
+    const double total_db = 10.0 * log10(acc_sum > 0 ? acc_sum : 1e-30);
+    const double td_db    = 10.0 * log10(td_power > 0 ? td_power : 1e-30);
+
+    printf("  spectrum : %d segs of %d bins (%.1f Hz/bin) at %.3f Msps\n",
+           used, fft_size, bin_hz, out_rate / 1e6);
+    printf("  total    : %.2f dBFS from the spectrum, %.2f dBFS from the samples "
+           "(must agree; the check is on this line)\n", total_db, td_db);
+    printf("  noise    : median %8.2f dBFS/bin  (10th pct %8.2f, 99th pct %8.2f)\n",
+           floor_db, p10_db, p99_db);
+    printf("  density  : %8.2f dBFS/Hz   <- lower is better sensitivity\n", dens);
+    printf("  peak     : %8.2f dBFS at %10.4f MHz\n", peak_db, 1e-6 * peak_f);
+    printf("  CNR      : %8.2f dB   (peak over median floor)\n", cnr);
+
+    if (verbose) {
+        int step = fft_size / 32; if (step < 1) step = 1;
+        printf("  bins (MHz, dBFS):\n");
+        for (int k = 0; k < fft_size; k += step)
+            printf("    %10.4f  %8.2f%s\n", center + (k - dc) * bin_hz,
+                   10.0 * log10(acc[k] > 0 ? acc[k] : 1e-30),
+                   (k >= dc - dc_guard && k <= dc + dc_guard) ? "   (DC)" : "");
+    }
+
+    fftwf_free(in); fftwf_free(out); free(acc); free(win); free(sorted);
+}
+#endif /* USE_FFTW */
+
+/* ---------------------------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
@@ -365,6 +497,10 @@ int main(int argc, char **argv)
     int scan_only = 0;
     int decim = 1;
     long long bb_rate = 0;      /* -B: use ad9361_set_bb_rate() instead of sampling_frequency */
+    int spec_mode = 0;          /* -S: report a spectrum and S/N */
+    int fft_size = 8192;        /* -F: FFT length, same default as ogn-rf's Inp_FFT */
+    int segs = 32;              /* -G: Welch segments to average */
+    const char *rx_port = NULL; /* -P: rf_port_select, e.g. A_BALANCED or A_N */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-u")) uri = opt(argc, argv, &i);
@@ -382,9 +518,17 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--scan")) scan_only = 1;
         else if (!strcmp(argv[i], "-D")) decim = atoi(opt(argc, argv, &i));
         else if (!strcmp(argv[i], "-B")) bb_rate = strtoll(opt(argc, argv, &i), NULL, 0);
+        else if (!strcmp(argv[i], "-S")) spec_mode = 1;
+        else if (!strcmp(argv[i], "-F")) fft_size = atoi(opt(argc, argv, &i));
+        else if (!strcmp(argv[i], "-G")) segs = atoi(opt(argc, argv, &i));
+        else if (!strcmp(argv[i], "-P")) rx_port = opt(argc, argv, &i);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [-u URI] [-f HZ] [-r HZ] [-g DB|auto] [-n N] [-o FILE] [-s SHIFT] [-b HZ] [-D N] [-v]\n", argv[0]);
             printf("       -D N   decimate by N in software after the chip, e.g. -r 4000000 -D 2 = 2.0 MSPS out\n");
+            printf("       -S     report a Welch spectrum: noise floor, peak, CNR and density\n");
+            printf("       -F N   FFT length for -S, default 8192 (the size ogn-rf uses at 2 MSPS)\n");
+            printf("       -G N   Welch segments to average, default 32\n");
+            printf("       -P PORT rf_port_select on voltage0: A_BALANCED, B_BALANCED, A_N, B_N, C_N...\n");
             printf("       -B HZ  set the rate with ad9361_set_bb_rate() - loads an RX FIR, and REACHES\n");
             printf("              RATES BELOW 2.083 MSPS that writing sampling_frequency cannot. Use this.\n");
             printf("       %s --scan      list contexts; exit 0 only if a usb:/ip: radio is openable\n", argv[0]);
@@ -474,6 +618,12 @@ int main(int argc, char **argv)
     if (p.rx0 && bw) {
         if (iio_channel_attr_write_longlong(p.rx0, "rf_bandwidth", (long long)bw) < 0)
             fprintf(stderr, "  could not set the bandwidth to %u Hz\n", bw);
+    }
+    if (p.rx0 && rx_port) {
+        if (iio_channel_attr_write(p.rx0, "rf_port_select", rx_port) < 0)
+            fprintf(stderr, "  could not select RX port %s\n", rx_port);
+        else
+            printf("  rf_port_select = %s\n", rx_port);
     }
     if (gain_auto) {
         if (write_gain_mode(&p, "slow_attack") < 0)
@@ -571,6 +721,19 @@ int main(int argc, char **argv)
     long long n_out = 0;
     int refills = 0;
 
+#ifdef USE_FFTW
+    float *sp_i = NULL, *sp_q = NULL;
+    size_t sp_cap = 0, sp_n = 0;
+    if (spec_mode) {
+        sp_cap = (size_t)fft_size * (size_t)segs;
+        sp_i = malloc(sizeof(float) * sp_cap);
+        sp_q = malloc(sizeof(float) * sp_cap);
+        if (!sp_i || !sp_q) { printf("  spectrum: out of memory\n"); spec_mode = 0; }
+    }
+#else
+    if (spec_mode) { printf("  -S needs FFTW (built without USE_FFTW)\n"); spec_mode = 0; }
+#endif
+
     while (n < want) {
         if (iio_buffer_refill(buf) < 0) break;
         refills++;
@@ -613,6 +776,9 @@ int main(int argc, char **argv)
                 uint8_t o[2] = { (uint8_t)(((int)di >> shift) + 128), (uint8_t)(((int)dq >> shift) + 128) };
                 if (fwrite(o, 1, 2, out) != 2) { /* stopped writing; keep capturing */ }
             }
+#ifdef USE_FFTW
+            if (spec_mode && sp_n < sp_cap) { sp_i[sp_n] = (float)di; sp_q[sp_n] = (float)dq; sp_n++; }
+#endif
         }
     }
     if (out) {
@@ -725,6 +891,14 @@ int main(int argc, char **argv)
         printf("  Next: sweep -g to find where the noise floor sits and where it starts to clip,\n"
                "        and write the gain law down in docs/hardware.md.\n");
     }
+
+#ifdef USE_FFTW
+    if (spec_mode && sp_n > 0)
+        report_spectrum(sp_i, sp_q, sp_n, fft_size, segs,
+                        (have_rate && got_rate > 0) ? (double)got_rate / decim : 0.0,
+                        have_freq ? (uint32_t)got_freq : freq, fullscale, verbosity >= 1);
+    free(sp_i); free(sp_q);
+#endif
 
     iio_context_destroy(ctx);
     return bad ? 1 : 0;
