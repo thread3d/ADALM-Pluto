@@ -26,8 +26,9 @@ verified against live hardware.**
 | `libiio` headers | **present** — `libiio-dev` 0.19-1, so a backend can be built here |
 | `iio-utils` (`iio_info`, `iio_attr`) | **missing** — not installed; `probe-pluto.sh` works without it |
 | udev rule for non-root USB access | **written, not installed** — needs one `sudo` run of `scripts/install-pluto-udev.sh` |
-| Probe (device-level, independent of ogn-rf) | **written and compiled**, **not yet run against a device** |
-| `adalm-pluto` backend in ogn-rf | **not started** — design only, in [`docs/ogn-rf-integration.md`](docs/ogn-rf-integration.md) |
+| Probe (device-level, independent of ogn-rf) | **written, compiled and exercised** — fails correctly against no device; **never yet against a radio** |
+| `adalm-pluto` branch of ogn-rf | **created and pushed** — `thread3d/ogn-rf@cbc2759`, design document only |
+| The backend itself (`plutosdr.h`) | **not started** — design only, in [`docs/ogn-rf-integration.md`](docs/ogn-rf-integration.md) |
 | Live OGN packet decoding | **not started** — cannot begin until the USB link is stable |
 
 The honest summary: the repository, the tooling and the design are in place, and the hardware is not.
