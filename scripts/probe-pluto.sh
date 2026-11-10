@@ -162,7 +162,14 @@ if [ "$PLUTO_FOUND" = 1 ]; then
     say "  libiio scan: skipped, /usr/include/iio.h is missing (install libiio-dev)"
   else
     if [ ! -x "$PBIN" ] || [ "$PSRC" -nt "$PBIN" ]; then
-      gcc -O2 -w -o "$PBIN" "$PSRC" -liio -lm 2>/dev/null
+      # libad9361 gives us ad9361_set_bb_rate(), which is the only way to get exactly 2.0 or 1.0
+      # MSPS out of the chip - the plain sampling_frequency attribute bottoms out at 2083333 Hz.
+      if [ -r /usr/include/ad9361.h ]; then
+        gcc -O2 -w -DUSE_AD9361 -o "$PBIN" "$PSRC" -liio -lad9361 -lm 2>/dev/null || \
+        gcc -O2 -w -o "$PBIN" "$PSRC" -liio -lm 2>/dev/null
+      else
+        gcc -O2 -w -o "$PBIN" "$PSRC" -liio -lm 2>/dev/null
+      fi
     fi
     if [ -x "$PBIN" ]; then
       LIBIIO_SCAN=$("$PBIN" --scan 2>/dev/null | tail -1)

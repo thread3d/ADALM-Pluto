@@ -474,3 +474,85 @@ The shipped config now takes the first option, since it is both the lightest loa
 asks least of the host. It costs a 4 % difference in rate, and if ogn-rf's demodulator turns out to
 want exactly 2.000 MSPS the fallback is one line: `ChipRate = 4000000`, `Decimate = 2`,
 `SampleRate = 2000000`.
+
+---
+
+## 2026-11-10 (later still) — the chip reaches exactly 2.0 MSPS after all
+
+Reading `ogn-rf.cc` properly overturned two conclusions in this file, and both were mine.
+
+### The FFT size is 8192, not 1024
+
+`Inp_FFT::Preset()` — the OGN demodulator path — computes
+
+```cpp
+FFTsize = (8*8*SampleRate)/15625;      // 8*8, not 8
+```
+
+so at 2.000 MSPS the transform is **8192 = 2¹³**. Two earlier entries in this file compared 1024 with
+1066; those are `GSM_FFT` sizes, the GSM calibration spectrogram, which really does use
+`8*SampleRate/15625`. The numbers that decide the rate are these:
+
+| SampleRate | OGN FFTsize | factorisation |
+|---|---|---|
+| 1 000 000 | 4096 | 2¹² |
+| **2 000 000** | **8192** | **2¹³** |
+| 2 048 000 | 8388 | 2²·3²·**233** |
+| 2 083 333 | 8533 | 7·**23**·**53** |
+
+Exactly 2.000 MSPS gives a power of two; 2.0833 gives 8533 = 7×23×53, which FFTW has to run through
+generic codelets. That is a far better reason to want 2.000 than anything about USB rates.
+
+### 2.0 MSPS is reachable — just not through `sampling_frequency`
+
+The pasted `PlutoSDR` class calls `ad9361_set_bb_rate(phy, DEFAULT_SAMPLE_RATE)`, and that is a
+different thing from writing the attribute: it designs and loads an **RX FIR** with decimation, in
+addition to the HB stages. The 2.083 MSPS floor applies only to the attribute-only path. Measured
+here, **libad9361-0 / libad9361-dev 0.2-1** is installed (`/usr/include/ad9361.h`, `libad9361.so.0.2`):
+
+| `ad9361_set_bb_rate()` | Applied | ADC clock | Chain |
+|---|---|---|---|
+| 1 000 000 | **999 999 Hz** | 32 MHz | R2 ÷2 → 16 M, R1 ÷2 → 8 M, FIR ÷4 → 1 M |
+| **2 000 000** | **1 999 999 Hz** | **64 MHz** | R2 ÷2 → 32 M, R1 ÷2 → 16 M, FIR ÷4 → 2 M |
+| 2 083 333 | 2 083 332 Hz | 66.7 MHz | FIR ÷2 instead |
+
+So the earlier claim in this file — "2.000 MSPS cannot come out of the chip at all, a software step is
+unavoidable" — was **wrong**. It was true of the attribute and false of the chip. The converter runs
+at 64 MHz, every decimation stage is on-chip, and the host does nothing.
+
+End to end at exactly 2.0 MSPS: **99.9 % delivered, +2 ms overhead, 1.998 Msps sustained, 8.0 MB/s,
+rms 0.7 %FS, crest 5.34, nothing clipped, PASS**, with `filter_fir_en = 1`.
+
+### The 56 MHz bandwidth in that class costs about 5 dB
+
+`DEFAULT_BANDWIDTH 56000000` is commented "as wide as possible to encourage a high sample rate and
+then decimation". The premise is unnecessary — the ADC already runs at 64 MHz — and the cost is real.
+Measured at 100 MHz FM, 2 MSPS, gain 73 dB:
+
+| `rf_bandwidth` | rms %FS | peak %FS |
+|---|---|---|
+| 1 MHz (what `ad9361_set_bb_rate` picks alone) | 8.8 | 61.0 |
+| 2 MHz | 11.1 | 71.9 |
+| **4 MHz** | **11.5** | **73.8** |
+| 8 MHz | 11.5 | 69.1 |
+| 18 MHz (driver default) | 9.0 | 52.1 |
+| 56 MHz | 6.5 | 47.3 |
+
+4 MHz — about twice the output rate — is the peak, and 56 MHz is 5 dB below it.
+
+### Three things in the pasted class that will not work as written
+
+1. **`#define DEFAULT_URI "ip:pluto.local"`** — the network transport is not available on this board:
+   `rndis_host` and `cdc_acm` are modules that are not loaded, so the Pluto never creates a `usb0` or
+   a `ttyACM`, and there is nothing for libiio's network backend to talk to. It has to be `usb:`.
+   (Which in turn needs the udev rule, and the URI's device address changes on every replug, so the
+   context must be found by serial.)
+2. **`setFreqCorrection()` returns 0** — a silent no-op. `xo_correction` exists as a device attribute
+   (measured 39 999 890 Hz, range 39 991 891–40 007 889, i.e. ±200 ppm at 1 Hz resolution) and this
+   is where a ppm correction belongs.
+3. **`getTunerBandwidths()`** assigns to its `const int *Bandwidth` parameter —
+   `Bandwidth = {new int[8]{...}}` — which cannot compile as intended and would leak if it did. The
+   bandwidths should be written into the caller's array.
+
+Also worth noting for the backend: `ad9361_set_bb_rate()` must not be followed by a
+`sampling_frequency` write, which would undo the FIR configuration it just set up.

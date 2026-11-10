@@ -150,42 +150,48 @@ existing `tools/spectrum.py`: inject a known-level signal, sweep gain, and pick 
 the full 8-bit range without clipping. Until then the backend takes a constant, and the constant is
 documented at its definition as provisional.
 
-### Rate: the chip decimates on-chip already, and USB is the real ceiling
+### Rate: the chip produces exactly 2.000 MSPS itself
 
-The intuition worth correcting here: it is natural to think the right move is to run the Pluto at its
-maximum sample rate and let its internal decimator hand 2 MSPS to ogn-rf. Measured, that is backwards
-on both counts, and `docs/hardware.md` has the tables.
+**`ad9361_set_bb_rate(2000000)` makes the chip output 1 999 999 Hz with no host-side resampling.**
+That is the whole of the rate design, and it is worth stating what it replaced, because this document
+argued the opposite for a while.
 
-**`sampling_frequency` is the post-decimation output rate, and the chip filters on every setting.**
-`rx_path_rates` shows the chain it picks: at 4 MSPS the ADC runs at 32 MHz with HB3 ÷2, HB2 ÷2 and the
-RX FIR ÷2 (÷8 overall); at 61.44 MSPS the ADC runs at 491.52 MHz with the *same* ÷8. Only the minimum
-data rate gets the extra ÷12. So a higher rate raises the ADC clock and the USB traffic and changes
-nothing else.
+The plain `sampling_frequency` attribute bottoms out at **2 083 333 Hz** — at that rate the ADC is at
+25 MHz and the HB stages alone give ÷12. `ad9361_set_bb_rate()` is a different path: it designs and
+loads an **RX FIR** (decimation up to ÷4) on top of the HB stages, and reaches far below the
+attribute's floor. Measured:
 
-**USB saturates near 8 MSPS / 31 MB/s.** Measured sustained: 2.03 Msps for a 2.08 MSPS request,
-3.85 for 4, 7.66 for 8 — and requests for 15.36, 30.72 and 61.44 MSPS all delivered about 8 Msps and
-31 MB/s. The chip accepts the rate; the link drops the rest. USB 2.0's theoretical 60 MB/s, halved by
-protocol overhead and two hubs, is the ceiling.
+| `ad9361_set_bb_rate()` | Applied | ADC clock | Chain |
+|---|---|---|---|
+| 1 000 000 | 999 999 Hz | 32 MHz | ÷2 ÷2, FIR ÷4 |
+| **2 000 000** | **1 999 999 Hz** | **64 MHz** | ÷2 ÷2, FIR ÷4 |
+| 2 083 333 | 2 083 332 Hz | 66.7 MHz | ÷2 ÷2, FIR ÷2 |
 
-So `setOversample()` is not about buying headroom from the chip's decimator — it is about landing on
-the rate ogn-rf's DSP wants while staying well inside what USB can carry:
+So the converter runs at 64 MHz, every decimation stage is on-chip, USB carries 8 MB/s, and the
+backend performs no resampling at all.
 
-| Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
-|---|---|---|---|---|---|
-| 2 083 333 | **÷12** | none, but the rate is 2.0833 | 2 083 333 | 8 MB/s | `SpectrogramFFTsize` becomes 1066 and every rate-dependent constant shifts 4 % |
-| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | **the choice** — exact rate, 4x USB headroom |
-| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | at the USB ceiling for no gain |
-| 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | the link delivers 8 MSPS |
+**Exactly 2.000 rather than 2.083 decides itself, on grounds of FFT size.**
+`Inp_FFT::Preset()` computes `FFTsize=(8*8*SampleRate)/15625`:
 
-The tie-breaker is arithmetic that is not arbitrary: **8 x 2 000 000 / 15 625 = 1024 exactly**, so
-ogn-rf's spectrogram is the power-of-two FFT it was written for. At 2 083 333 the same expression gives
-1066, and at the RTL-SDR's 2 048 000 it gives 1048 — so 2.0 MSPS is the rate ogn-rf actually wants,
-and hitting it exactly is worth one box filter.
+| SampleRate | OGN FFTsize | factorisation |
+|---|---|---|
+| 1 000 000 | 4096 | 2¹² |
+| **2 000 000** | **8192** | **2¹³** |
+| 2 048 000 | 8388 | 2²·3²·233 |
+| 2 083 333 | 8533 | 7·23·53 |
 
-Validated with the ÷2 stage implemented in the probe (`-r 4000000 -D 2`): 1 000 000 samples out at
-exactly 2 000 000 Hz; rms 0.7 %FS against 0.8 %FS undecimated (the ~1/√2 a box filter over
-independent noise should give), crest 5.02, nothing clipped. The filter is the same shape as ogn-rf's
-own `boxfilter.h`.
+2.0833 MSPS gives a 8533-point transform with two large primes in it, which FFTW runs through generic
+codelets; 8192 is a power of two.
+
+**Bandwidth: 4 MHz, not wide.** `ad9361_set_bb_rate` picks 1 MHz unaided; 4 MHz measured ~5 dB
+stronger at 100 MHz than 56 MHz (11.5 vs 6.5 %FS), and the driver default of 18 MHz is 9.0. There is
+no reason to open the analogue filter wide — the ADC is already at 64 MHz.
+
+Measured end to end at exactly 2.0 MSPS: 99.9 % delivered, +2 ms overhead, 1.998 Msps sustained,
+8.0 MB/s, rms 0.7 %FS, crest 5.34, nothing clipped.
+
+Two implementation notes for the backend: call `ad9361_set_bb_rate()` and **do not** then write
+`sampling_frequency`, which undoes the FIR setup; and the FIR costs a few samples of group delay.
 
 ## Configuration
 
@@ -206,8 +212,9 @@ design rather than confirming it casually.
 
 | Question | Answer | Consequence |
 |---|---|---|
-| **The rate floor** | `sampling_frequency_available = [2083333 1 61440000]`; 2083333 itself is rejected, **2083334 works and applies 2 083 333**; 1.0 and 2.048 MSPS rejected; 4.0 MSPS applies 3 999 999 | **decimation is required, not preferred** — `setOversample(2)` at a 4 MSPS chip rate giving 2.0 MSPS is right |
-| **The gain law** | range `[-1 1 73]`, 1 dB steps; the law is **not** 1 dB per dB (staged LNA/mixer/TIA/digital); nothing clips at 73 dB, where the floor is 0.9 %FS | use the measured table in `docs/hardware.md`; `Gain = 73` in the shipped config |
+| **The rate floor** | The *attribute* floors at 2 083 333 Hz (and rejects even that — ask for 2 083 334). **But `ad9361_set_bb_rate(2000000)` reaches 1 999 999 Hz** by loading an RX FIR | **no software resampling and no `setOversample()` needed** — the chip does it all |
+| **The gain law** | range `[-1 1 73]`, 1 dB steps; the law is **not** 1 dB per dB (staged LNA/mixer/TIA/digital); nothing clips at 73 dB | use the measured table in `docs/hardware.md`; `Gain = 73` in the shipped config |
+| **Bandwidth** | 4 MHz at 2 MSPS measured ~5 dB stronger than 56 MHz, and stronger than the driver's 18 MHz default | set it explicitly; do not leave it wide "to force a high rate", the ADC already runs at 64 MHz |
 | **Sample format** | 12-bit signed, shift 0 | the 8-bit conversion is a shift of 4, still to be calibrated against a known level |
 | **Which USB face** | interface 5 carries IIO; a `usb:` context opens reliably. The network gadget is **not** up: `rndis_host` and `cdc_acm` are modules that are not loaded, so no `usb0`, no `ttyACM` | USB is the transport; `ip:192.168.2.1` would need those modules first |
 | **Attribute locations** | `gain_control_mode` and `hardwaregain` are **channel** attributes of `voltage0` (input); `xo_correction` and `ensm_mode` are device attributes | this one cost an afternoon of a backend setting a gain the radio never applied |

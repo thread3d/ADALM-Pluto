@@ -46,6 +46,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <iio.h>
+#ifdef USE_AD9361
+#include <ad9361.h>
+#endif
 
 #ifndef VERSION
 #define VERSION "0.1"
@@ -361,6 +364,7 @@ int main(int argc, char **argv)
     int shift = 4;
     int scan_only = 0;
     int decim = 1;
+    long long bb_rate = 0;      /* -B: use ad9361_set_bb_rate() instead of sampling_frequency */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-u")) uri = opt(argc, argv, &i);
@@ -377,9 +381,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-v")) verbosity++;
         else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--scan")) scan_only = 1;
         else if (!strcmp(argv[i], "-D")) decim = atoi(opt(argc, argv, &i));
+        else if (!strcmp(argv[i], "-B")) bb_rate = strtoll(opt(argc, argv, &i), NULL, 0);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [-u URI] [-f HZ] [-r HZ] [-g DB|auto] [-n N] [-o FILE] [-s SHIFT] [-b HZ] [-D N] [-v]\n", argv[0]);
             printf("       -D N   decimate by N in software after the chip, e.g. -r 4000000 -D 2 = 2.0 MSPS out\n");
+            printf("       -B HZ  set the rate with ad9361_set_bb_rate() - loads an RX FIR, and REACHES\n");
+            printf("              RATES BELOW 2.083 MSPS that writing sampling_frequency cannot. Use this.\n");
             printf("       %s --scan      list contexts; exit 0 only if a usb:/ip: radio is openable\n", argv[0]);
             printf("       %s -u usb:1.4.4.3 -f 868200000 -r 4000000 -g 40 -n 2000000 -o 868.u8\n", argv[0]);
             printf("\nSee scripts/probe-pluto.sh, which builds and calls this.\n");
@@ -445,9 +452,24 @@ int main(int argc, char **argv)
         if (iio_channel_attr_write_longlong(p.lo, "frequency", (long long)freq) < 0)
             fprintf(stderr, "  could not set the RX LO to %u Hz\n", freq);
     }
-    if (p.rx0 && rate) {
+    if (bb_rate > 0) {
+        /* ad9361_set_bb_rate() is NOT the same thing as writing sampling_frequency. It designs and
+         * loads an RX FIR (decimating by up to 4) and sets the HB chain around it, which is how the
+         * chip reaches 2.0 or 1.0 MSPS at all - the plain attribute bottoms out at 2083333 Hz
+         * because without the FIR the HB chain alone runs out of decimation. Measured on this board:
+         * 2000000 -> RXSAMP 1999999, 1000000 -> RXSAMP 999999. */
+#ifdef USE_AD9361
+        int r = ad9361_set_bb_rate(p.dev, (unsigned long)bb_rate);
+        if (r != 0)
+            fprintf(stderr, "  ad9361_set_bb_rate(%lld) failed (%d)\n", bb_rate, r);
+        else
+            printf("  ad9361_set_bb_rate(%lld) applied\n", bb_rate);
+#else
+        fprintf(stderr, "  -B needs libad9361 (built without USE_AD9361)\n");
+#endif
+    } else if (p.rx0 && rate) {
         if (iio_channel_attr_write_longlong(p.rx0, "sampling_frequency", (long long)rate) < 0)
-            fprintf(stderr, "  could not set the sample rate to %u Hz (below the chip's floor?)\n", rate);
+            fprintf(stderr, "  could not set the sample rate to %u Hz (below the chip's floor - try -B)\n", rate);
     }
     if (p.rx0 && bw) {
         if (iio_channel_attr_write_longlong(p.rx0, "rf_bandwidth", (long long)bw) < 0)
@@ -480,6 +502,7 @@ int main(int argc, char **argv)
     /* The internal chain the chip settled on for this data rate: BBPLL, ADC, then each decimation
      * stage. This is the difference between "it decimates on chip" as a belief and as a reading. */
     print_attr_any(NULL, p.dev, "rx_path_rates", "RX path rates after");
+    print_attr_any(p.rx0, p.dev, "filter_fir_en", "RX FIR enabled");
     if (have_rate && got_rate > 0 && got_rate != (long long)rate)
         printf("  NOTE: the device changed the requested rate to %lld Hz\n", got_rate);
 
